@@ -1,0 +1,59 @@
+export interface GoogleDrivePluginSettings {
+  serverRelayUrl: string;
+  accessToken: string;
+  refreshToken: string;
+  tokenExpiry: number;
+  userEmail: string;
+  vaultName: string;
+  vaultFolderId: string;
+  deviceId: string;
+  lastSyncTime: string | null;
+  lastSyncStatus: 'up-to-date' | 'local-changes' | 'cloud-newer' | 'syncing' | 'failed' | 'offline' | 'unauthenticated';
+  customIgnoredPatterns: string[];
+  pendingOfflineChanges: string[];
+  syncedFileHashes: Record<string, string>;
+}
+
+export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
+  serverRelayUrl: 'http://localhost:5050',
+  accessToken: '',
+  refreshToken: '',
+  tokenExpiry: 0,
+  userEmail: '',
+  vaultName: 'DefaultVault',
+  vaultFolderId: '',
+  deviceId: `device_${Math.random().toString(36).substring(2, 9)}`,
+  lastSyncTime: null,
+  lastSyncStatus: 'unauthenticated',
+  customIgnoredPatterns: [],
+  pendingOfflineChanges: [],
+  syncedFileHashes: {},
+};
+
+export interface LocalFileHash {
+  relativePath: string;
+  hash: string;
+  size: number;
+  mtime: number;
+}
+
+export interface RemoteDriveFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  size?: string;
+  modifiedTime?: string;
+  md5Checksum?: string;
+  parents?: string[];
+}
+
+export interface SyncDiffResult {
+  toUpload: LocalFileHash[];
+  toDownload: RemoteDriveFile[];
+  conflicts: Array<{
+    relativePath: string;
+    remoteFile: RemoteDriveFile;
+    localFile: LocalFileHash;
+  }>;
+  status: 'up-to-date' | 'local-changes' | 'cloud-newer';
+}

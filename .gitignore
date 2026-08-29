@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Secrets & Local data
+data.json
+.env
+.env.local
+
+# Editor & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

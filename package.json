@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-google-drive-sync",
+  "version": "1.0.0",
+  "description": "Direct, manual, and private cloud synchronization for Obsidian vaults via personal Google Drive",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian", "obsidian-plugin", "google-drive", "cloud-sync", "sync"],
+  "author": "Obsidian Cloud Sync",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.3",
+    "obsidian": "latest",
+    "tslib": "^2.6.2",
+    "typescript": "^5.4.5"
+  }
+}
