@@ -1,6 +1,6 @@
 {
-  "id": "google-drive-sync",
-  "name": "Google Drive Sync",
+  "id": "obsidian-sync",
+  "name": "Obsidian Sync",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
   "description": "Sync your notes directly to your personal Google Drive account. Zero server database storage, manual Push/Pull, 100% private.",
