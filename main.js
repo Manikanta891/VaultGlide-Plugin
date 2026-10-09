@@ -27,7 +27,7 @@ __export(main_exports, {
   default: () => GoogleDriveSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian6 = require("obsidian");
+var import_obsidian7 = require("obsidian");
 
 // src/types.ts
 var DEFAULT_SETTINGS = {
@@ -49,7 +49,8 @@ var DEFAULT_SETTINGS = {
   syncCoreSettings: true,
   syncAppearance: true,
   syncCommunityPlugins: true,
-  syncWorkspaceLayout: false
+  syncWorkspaceLayout: false,
+  syncHistory: []
 };
 
 // src/gdrive/gdriveAuth.ts
@@ -626,7 +627,7 @@ var OfflineTracker = class {
 };
 
 // src/sync/manualSyncEngine.ts
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 
 // src/gdrive/folderTree.ts
 var FolderTreeManager = class {
@@ -714,14 +715,18 @@ var FolderTreeManager = class {
     const fileMap = /* @__PURE__ */ new Map();
     const traverse = async (folderId, currentPathPrefix) => {
       const items = await this.client.listFolderChildren(folderId);
+      const subfolderTasks = [];
       for (const item of items) {
         const itemRelativePath = currentPathPrefix ? `${currentPathPrefix}/${item.name}` : item.name;
         if (item.mimeType === "application/vnd.google-apps.folder") {
           this.folderIdCache.set(itemRelativePath, item.id);
-          await traverse(item.id, itemRelativePath);
+          subfolderTasks.push(traverse(item.id, itemRelativePath));
         } else {
           fileMap.set(itemRelativePath, item);
         }
+      }
+      if (subfolderTasks.length > 0) {
+        await Promise.all(subfolderTasks);
       }
     };
     await traverse(effectiveRootId, "");
@@ -791,12 +796,15 @@ var DEFAULT_IGNORED_PATTERNS = [
   "^.DS_Store$",
   "^Thumbs.db$",
   "~$",
-  ".tmp$"
+  ".tmp$",
+  "^VaultGlide Dashboard.md$"
 ];
 var LocalHasher = class {
   constructor(vault, getSettings) {
     this.vault = vault;
     this.getSettings = getSettings;
+    // In-memory cache mapping relativePath -> { mtime, size, hash } to skip flash storage reads
+    this.metaCache = /* @__PURE__ */ new Map();
   }
   /**
    * Computes SHA-256 hex string for binary buffer using Web Crypto API.
@@ -813,6 +821,7 @@ var LocalHasher = class {
    */
   isIgnored(path) {
     const clean = path.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (clean === "VaultGlide Dashboard.md") return true;
     const configDir = this.vault.configDir || ".obsidian";
     if (isConfigDirFile(clean, configDir)) {
       const settings = this.getSettings();
@@ -856,7 +865,7 @@ var LocalHasher = class {
   }
   /**
    * Scans all non-ignored vault files and eligible .obsidian config files,
-   * computing their hashes in parallel chunks.
+   * computing their hashes with fast mtime & size caching.
    */
   async scanVault() {
     const settings = this.getSettings();
@@ -870,10 +879,21 @@ var LocalHasher = class {
       const batchEntries = await Promise.all(
         batch.map(async (file) => {
           try {
+            const cleanPath = file.path.replace(/\\/g, "/").replace(/^\/+/, "");
+            const cached = this.metaCache.get(cleanPath);
+            if (cached && cached.mtime === file.stat.mtime && cached.size === file.stat.size) {
+              return {
+                relativePath: cleanPath,
+                hash: cached.hash,
+                size: cached.size,
+                mtime: cached.mtime
+              };
+            }
             const data = await this.vault.readBinary(file);
             const hash = await this.computeHash(data);
+            this.metaCache.set(cleanPath, { mtime: file.stat.mtime, size: file.stat.size, hash });
             return {
-              relativePath: file.path.replace(/\\/g, "/").replace(/^\/+/, ""),
+              relativePath: cleanPath,
               hash,
               size: file.stat.size,
               mtime: file.stat.mtime
@@ -918,6 +938,212 @@ var LocalHasher = class {
   }
 };
 
+// src/ui/dashboardNote.ts
+var import_obsidian4 = require("obsidian");
+var _DashboardNoteManager = class _DashboardNoteManager {
+  constructor(app, getSettings, saveSettings) {
+    this.app = app;
+    this.getSettings = getSettings;
+    this.saveSettings = saveSettings;
+  }
+  /**
+   * Formats byte size into human readable string.
+   */
+  formatBytes(bytes) {
+    if (!bytes || bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+  }
+  /**
+   * Returns human-formatted relative time.
+   */
+  formatTimestamp(isoString) {
+    if (!isoString) return "Never";
+    try {
+      const d = new Date(isoString);
+      return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch (e) {
+      return isoString;
+    }
+  }
+  /**
+   * Scans local vault for statistics on markdown notes.
+   */
+  getVaultStats() {
+    const files = this.app.vault.getFiles().filter((f) => f.extension === "md" && f.name !== _DashboardNoteManager.DASHBOARD_FILE);
+    const totalNotes = files.length;
+    const totalSize = files.reduce((acc, f) => {
+      var _a;
+      return acc + (((_a = f.stat) == null ? void 0 : _a.size) || 0);
+    }, 0);
+    const totalFolders = this.app.vault.getAllLoadedFiles().filter((f) => "children" in f).length;
+    return { totalNotes, totalSize, totalFolders };
+  }
+  /**
+   * Generates formatted Markdown content for the VaultGlide Dashboard note.
+   */
+  generateDashboardMarkdown(diff) {
+    const settings = this.getSettings();
+    const stats = this.getVaultStats();
+    const newFiles = (diff == null ? void 0 : diff.newFiles) || [];
+    const modifiedFiles = (diff == null ? void 0 : diff.modifiedFiles) || [];
+    const deletedFiles = (diff == null ? void 0 : diff.deletedFiles) || [];
+    const totalPending = newFiles.length + modifiedFiles.length + deletedFiles.length;
+    let statusBadge = "\u{1F7E2} **Up to Date**";
+    let statusCalloutType = "info";
+    if (diff == null ? void 0 : diff.isSyncing) {
+      statusBadge = `\u{1F535} **Syncing in Progress...** (${diff.syncProgress || "Transferring"})`;
+      statusCalloutType = "note";
+    } else if (totalPending > 0) {
+      statusBadge = `\u{1F7E1} **${totalPending} Pending Change(s)** (Ready to Push)`;
+      statusCalloutType = "warning";
+    } else if (settings.lastSyncStatus === "offline") {
+      statusBadge = "\u26AA **Offline**";
+      statusCalloutType = "question";
+    } else if (settings.lastSyncStatus === "failed") {
+      statusBadge = "\u{1F534} **Last Sync Failed**";
+      statusCalloutType = "failure";
+    }
+    const lines = [];
+    lines.push("# \u{1F680} VaultGlide \u2014 Cloud Sync Dashboard\n");
+    lines.push(`> [!${statusCalloutType}] **Cloud Sync Status**`);
+    lines.push(`> - **Google Account:** ${settings.userEmail || "Not Connected"}`);
+    lines.push(`> - **Vault Name:** \`${settings.vaultName || "DefaultVault"}\``);
+    lines.push(`> - **Status:** ${statusBadge}`);
+    lines.push(`> - **Last Synced:** ${this.formatTimestamp(settings.lastSyncTime)}
+`);
+    lines.push("```vaultglide-actions\n```\n");
+    lines.push("---\n");
+    lines.push("## \u{1F4CA} Vault Statistics\n");
+    lines.push("| Metric | Value |");
+    lines.push("| :--- | :--- |");
+    lines.push(`| **Total Markdown Notes** | \`${stats.totalNotes} notes\` |`);
+    lines.push(`| **Total Vault Size** | \`${this.formatBytes(stats.totalSize)}\` |`);
+    lines.push(`| **Tracked Cloud Hashes** | \`${Object.keys(settings.syncedFileHashes || {}).length} files\` |`);
+    lines.push(`| **Google Drive Folder ID** | \`${settings.vaultFolderId || "Pending initial sync"}\` |
+`);
+    lines.push("---\n");
+    lines.push("## \u{1F4CB} Pending Changes (Local vs Google Drive)\n");
+    if (totalPending === 0) {
+      lines.push("\u2728 *All notes are completely synchronized with Google Drive. No pending uploads or deletions.*\n");
+    } else {
+      if (newFiles.length > 0) {
+        lines.push(`### \u{1F7E2} New Notes to Upload (${newFiles.length})
+`);
+        lines.push("| Note Path | Size | Action |");
+        lines.push("| :--- | :--- | :--- |");
+        for (const f of newFiles.slice(0, 25)) {
+          lines.push(`| \`${f.path}\` | ${this.formatBytes(f.size)} | \u2795 Upload to Drive |`);
+        }
+        if (newFiles.length > 25) {
+          lines.push(`| *... and ${newFiles.length - 25} more notes* | | |`);
+        }
+        lines.push("");
+      }
+      if (modifiedFiles.length > 0) {
+        lines.push(`### \u{1F7E1} Modified Notes (${modifiedFiles.length})
+`);
+        lines.push("| Note Path | Size | Action |");
+        lines.push("| :--- | :--- | :--- |");
+        for (const f of modifiedFiles.slice(0, 25)) {
+          lines.push(`| \`${f.path}\` | ${this.formatBytes(f.size)} | \u{1F504} Update on Drive |`);
+        }
+        if (modifiedFiles.length > 25) {
+          lines.push(`| *... and ${modifiedFiles.length - 25} more notes* | | |`);
+        }
+        lines.push("");
+      }
+      if (deletedFiles.length > 0) {
+        lines.push(`### \u{1F534} Deleted Notes to Trash (${deletedFiles.length})
+`);
+        lines.push("| Note Path | Action |");
+        lines.push("| :--- | :--- |");
+        for (const f of deletedFiles.slice(0, 25)) {
+          lines.push(`| \`${f.path}\` | \u{1F5D1}\uFE0F Move to Drive Trash |`);
+        }
+        if (deletedFiles.length > 25) {
+          lines.push(`| *... and ${deletedFiles.length - 25} more notes* | |`);
+        }
+        lines.push("");
+      }
+    }
+    lines.push("---\n");
+    lines.push("## \u26A1 Live Sync Progress\n");
+    if (diff == null ? void 0 : diff.isSyncing) {
+      lines.push(`> \u{1F504} **Actively Syncing:** ${diff.syncProgress || "Processing..."}
+`);
+    } else {
+      lines.push("> \u23F3 **Idle** \u2014 Ready for manual Push or Pull.\n");
+    }
+    lines.push("---\n");
+    lines.push("## \u{1F4DC} Recent Sync History\n");
+    const history = settings.syncHistory || [];
+    if (history.length === 0) {
+      lines.push("*No sync sessions recorded yet.*\n");
+    } else {
+      lines.push("| Timestamp | Direction | Items | Result |");
+      lines.push("| :--- | :--- | :--- | :--- |");
+      for (const entry of history.slice(0, 10)) {
+        const icon = entry.type === "push" ? "\u2B06\uFE0F Push" : "\u2B07\uFE0F Pull";
+        const resIcon = entry.status === "success" ? "\u2705 Success" : `\u274C Failed (${entry.error || "Error"})`;
+        lines.push(`| ${this.formatTimestamp(entry.timestamp)} | ${icon} | ${entry.filesCount} file(s) | ${resIcon} |`);
+      }
+      lines.push("");
+    }
+    lines.push("> [!tip] **Tip**\n> You can trigger sync anytime via the ribbon icons on the left, the command palette (`Ctrl/Cmd + P`), or the action buttons above.");
+    return lines.join("\n");
+  }
+  /**
+   * Writes the updated dashboard content to VaultGlide Dashboard.md.
+   */
+  async writeDashboardNote(diff) {
+    const content = this.generateDashboardMarkdown(diff);
+    const path = _DashboardNoteManager.DASHBOARD_FILE;
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing instanceof import_obsidian4.TFile) {
+        await this.app.vault.modify(existing, content);
+      } else {
+        await this.app.vault.create(path, content);
+      }
+    } catch (err) {
+      try {
+        await this.app.vault.adapter.write(path, content);
+      } catch (adapterErr) {
+        console.warn("Could not write VaultGlide Dashboard note:", adapterErr);
+      }
+    }
+  }
+  /**
+   * Opens the dashboard note in an active or new leaf.
+   */
+  async openDashboardNote() {
+    await this.writeDashboardNote();
+    const file = this.app.vault.getAbstractFileByPath(_DashboardNoteManager.DASHBOARD_FILE);
+    if (file instanceof import_obsidian4.TFile) {
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(file);
+    }
+  }
+  /**
+   * Appends an entry to the sync history ledger.
+   */
+  async recordHistory(entry) {
+    const settings = this.getSettings();
+    settings.syncHistory = settings.syncHistory || [];
+    settings.syncHistory.unshift(entry);
+    if (settings.syncHistory.length > 20) {
+      settings.syncHistory = settings.syncHistory.slice(0, 20);
+    }
+    await this.saveSettings();
+    await this.writeDashboardNote();
+  }
+};
+_DashboardNoteManager.DASHBOARD_FILE = "VaultGlide Dashboard.md";
+var DashboardNoteManager = _DashboardNoteManager;
+
 // src/sync/manualSyncEngine.ts
 var ManualSyncEngine = class {
   constructor(app, getSettings, loadSettings, saveSettings, client, offlineTracker, statusBar) {
@@ -929,6 +1155,7 @@ var ManualSyncEngine = class {
     this.offlineTracker = offlineTracker;
     this.statusBar = statusBar;
     this.hasher = new LocalHasher(app.vault, () => this.getSettings());
+    this.dashboard = new DashboardNoteManager(app, getSettings, saveSettings);
     this.folderTree = new FolderTreeManager(
       client,
       () => this.getSettings().vaultFolderId,
@@ -950,17 +1177,17 @@ var ManualSyncEngine = class {
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
     if (!settings.accessToken) {
-      new import_obsidian4.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
+      new import_obsidian5.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
       this.statusBar.setStatus("unauthenticated");
       return;
     }
     if (!navigator.onLine) {
-      new import_obsidian4.Notice("Google Drive Sync: You are offline. Changes remain saved locally.");
+      new import_obsidian5.Notice("Google Drive Sync: You are offline. Changes remain saved locally.");
       this.statusBar.setStatus("offline", `${settings.pendingOfflineChanges.length} pending`);
       return;
     }
     this.statusBar.setStatus("syncing", "Scanning...");
-    new import_obsidian4.Notice("Google Drive Sync: Checking vault changes...");
+    new import_obsidian5.Notice("Google Drive Sync: Checking vault changes...");
     try {
       const rootFolderId = await this.folderTree.getOrEnsureRootId();
       const [localFiles, remoteMap] = await Promise.all([
@@ -1023,7 +1250,7 @@ var ManualSyncEngine = class {
         }
       }
       if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0) {
-        new import_obsidian4.Notice("Google Drive Sync: Everything is up to date. Nothing to push.");
+        new import_obsidian5.Notice("Google Drive Sync: Everything is up to date. Nothing to push.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
         await this.saveSettings();
@@ -1071,62 +1298,89 @@ var ManualSyncEngine = class {
         this.statusBar.setStatus("syncing", "Preparing folders...");
         await Promise.all(uniqueFolders.map((p) => this.folderTree.ensureFolderPath(`${p}/placeholder.md`)));
       }
-      let uploadedCount = 0;
+      let uploadedCount2 = 0;
       const total = toUpload.length;
-      const CONCURRENCY_BATCH = 10;
-      for (let i = 0; i < total; i += CONCURRENCY_BATCH) {
-        const batch = toUpload.slice(i, i + CONCURRENCY_BATCH);
-        await Promise.all(
-          batch.map(async (item) => {
-            const cleanPath = item.local.relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+      const queue = [...toUpload];
+      const WORKER_COUNT = 6;
+      let progressNotice = new import_obsidian5.Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
+      const updatePushStatus = (currentFilename) => {
+        const pct = Math.round(uploadedCount2 / total * 100);
+        this.statusBar.setStatus("syncing", `${uploadedCount2}/${total} (${pct}%)`);
+        if (progressNotice) {
+          progressNotice.setMessage(`VaultGlide: [${uploadedCount2}/${total}] ${currentFilename} (${pct}%)`);
+        }
+      };
+      const workers = Array(Math.min(WORKER_COUNT, queue.length)).fill(0).map(async () => {
+        while (queue.length > 0) {
+          const item = queue.shift();
+          if (!item) break;
+          const cleanPath = item.local.relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+          const filename = cleanPath.split("/").pop();
+          updatePushStatus(filename);
+          try {
             const binaryData = await this.readLocalFileBinary(cleanPath);
             if (binaryData) {
               const mimeType = this.getMimeType(cleanPath);
-              const onProgress = item.local.size > 5 * 1024 * 1024 ? (uploadedBytes, totalBytes) => {
-                const pct = Math.round(uploadedBytes / totalBytes * 100);
-                const filename = cleanPath.split("/").pop();
-                this.statusBar.setStatus("syncing", `${filename} (${pct}%)`);
-              } : void 0;
               if (item.remote) {
-                await this.client.updateFileContent(item.remote.id, mimeType, binaryData, onProgress);
+                await this.client.updateFileContent(item.remote.id, mimeType, binaryData);
               } else {
                 const parentFolderId = await this.folderTree.ensureFolderPath(cleanPath);
-                const filename = cleanPath.split("/").pop();
-                await this.client.uploadNewFile(filename, parentFolderId, mimeType, binaryData, onProgress);
+                await this.client.uploadNewFile(filename, parentFolderId, mimeType, binaryData);
               }
               settings.syncedFileHashes[cleanPath] = item.local.hash;
-              uploadedCount++;
-              this.statusBar.setStatus("syncing", `${uploadedCount}/${total}`);
+              uploadedCount2++;
+              updatePushStatus(filename);
             }
-          })
-        );
+          } catch (itemErr) {
+            console.warn(`Could not upload ${cleanPath}:`, itemErr);
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (progressNotice) {
+        progressNotice.hide();
+        progressNotice = null;
       }
       settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
       settings.lastSyncStatus = "up-to-date";
       await this.saveSettings();
       await this.offlineTracker.clearPendingChanges();
       this.statusBar.setStatus("up-to-date");
-      let noticeMsg = `Google Drive Sync: Successfully pushed ${uploadedCount} file(s) to Drive!`;
-      if (uploadedCount > 0 && trashedCount > 0) {
-        noticeMsg = `Google Drive Sync: Uploaded ${uploadedCount} file(s), moved ${trashedCount} deleted file(s) to Drive trash!`;
+      await this.dashboard.recordHistory({
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        type: "push",
+        filesCount: uploadedCount2,
+        trashedCount,
+        status: "success"
+      });
+      let noticeMsg = `Google Drive Sync: Successfully pushed ${uploadedCount2} file(s) to Drive!`;
+      if (uploadedCount2 > 0 && trashedCount > 0) {
+        noticeMsg = `Google Drive Sync: Uploaded ${uploadedCount2} file(s), moved ${trashedCount} deleted file(s) to Drive trash!`;
       } else if (trashedCount > 0) {
         noticeMsg = `Google Drive Sync: Moved ${trashedCount} deleted file(s) to Drive trash!`;
       }
-      new import_obsidian4.Notice(noticeMsg);
+      new import_obsidian5.Notice(noticeMsg);
     } catch (err) {
       const isOffline = ((_a = err.message) == null ? void 0 : _a.includes("NETWORK_OFFLINE")) || ((_b = err.message) == null ? void 0 : _b.includes("UnknownHostException")) || ((_c = err.message) == null ? void 0 : _c.includes("ENOTFOUND")) || ((_d = err.message) == null ? void 0 : _d.includes("Failed to fetch"));
       if (isOffline) {
         settings.lastSyncStatus = "offline";
         await this.saveSettings();
         this.statusBar.setStatus("offline");
-        new import_obsidian4.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
+        new import_obsidian5.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
         return;
       }
       console.error("Push Error:", err);
       settings.lastSyncStatus = "failed";
       await this.saveSettings();
       this.statusBar.setStatus("failed");
-      new import_obsidian4.Notice(`Google Drive Push failed: ${err.message}`);
+      await this.dashboard.recordHistory({
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        type: "push",
+        filesCount: uploadedCount,
+        status: "failed",
+        error: err.message
+      });
+      new import_obsidian5.Notice(`Google Drive Push failed: ${err.message}`);
     }
   }
   /**
@@ -1138,17 +1392,17 @@ var ManualSyncEngine = class {
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
     if (!settings.accessToken) {
-      new import_obsidian4.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
+      new import_obsidian5.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
       this.statusBar.setStatus("unauthenticated");
       return;
     }
     if (!navigator.onLine) {
-      new import_obsidian4.Notice("Google Drive Sync: You are offline.");
+      new import_obsidian5.Notice("Google Drive Sync: You are offline.");
       this.statusBar.setStatus("offline");
       return;
     }
     this.statusBar.setStatus("syncing", "Scanning cloud...");
-    new import_obsidian4.Notice("Google Drive Sync: Checking Google Drive for changes...");
+    new import_obsidian5.Notice("Google Drive Sync: Checking Google Drive for changes...");
     try {
       const rootFolderId = await this.folderTree.getOrEnsureRootId();
       const [localFiles, remoteMap] = await Promise.all([
@@ -1174,7 +1428,7 @@ var ManualSyncEngine = class {
                 }
               } else {
                 const abstractFile = this.app.vault.getAbstractFileByPath(trackedPath);
-                if (abstractFile instanceof import_obsidian4.TFile) {
+                if (abstractFile instanceof import_obsidian5.TFile) {
                   await this.app.vault.trash(abstractFile, true);
                   delete settings.syncedFileHashes[trackedPath];
                   localTrashedCount++;
@@ -1211,41 +1465,72 @@ var ManualSyncEngine = class {
         }
       }
       if (toDownload.length === 0 && localTrashedCount === 0) {
-        new import_obsidian4.Notice("Google Drive Sync: Your vault is already up to date with Google Drive.");
+        new import_obsidian5.Notice("Google Drive Sync: Your vault is already up to date with Google Drive.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
         await this.saveSettings();
         this.statusBar.setStatus("up-to-date");
         return;
       }
-      let downloadedCount = 0;
+      let downloadedCount2 = 0;
       let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
-      for (const remoteFile of toDownload) {
-        const relPath = this.getRelativePathForRemote(remoteFile, remoteMap);
-        const data = await this.client.downloadFileContent(remoteFile.id);
-        await this.writeLocalFileBinary(relPath, data);
-        if (isPluginOrThemeFile(relPath, configDir)) {
-          hasUpdatedPluginsOrThemes = true;
+      const queue = [...toDownload];
+      const WORKER_COUNT = 6;
+      let pullNotice = new import_obsidian5.Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
+      const updatePullStatus = (currentFilename) => {
+        const pct = Math.round(downloadedCount2 / total * 100);
+        this.statusBar.setStatus("syncing", `Pulling ${downloadedCount2}/${total} (${pct}%)`);
+        if (pullNotice) {
+          pullNotice.setMessage(`VaultGlide: [${downloadedCount2}/${total}] ${currentFilename} (${pct}%)`);
         }
-        const newHash = await this.hasher.computeHash(data);
-        settings.syncedFileHashes[relPath] = newHash;
-        downloadedCount++;
-        this.statusBar.setStatus("syncing", `Pulling ${downloadedCount}/${total}`);
+      };
+      const workers = Array(Math.min(WORKER_COUNT, queue.length)).fill(0).map(async () => {
+        while (queue.length > 0) {
+          const remoteFile = queue.shift();
+          if (!remoteFile) break;
+          const relPath = this.getRelativePathForRemote(remoteFile, remoteMap);
+          const filename = relPath.split("/").pop();
+          updatePullStatus(filename);
+          try {
+            const data = await this.client.downloadFileContent(remoteFile.id);
+            await this.writeLocalFileBinary(relPath, data);
+            if (isPluginOrThemeFile(relPath, configDir)) {
+              hasUpdatedPluginsOrThemes = true;
+            }
+            const newHash = await this.hasher.computeHash(data);
+            settings.syncedFileHashes[relPath] = newHash;
+            downloadedCount2++;
+            updatePullStatus(filename);
+          } catch (dlErr) {
+            console.warn(`Could not pull ${relPath}:`, dlErr);
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (pullNotice) {
+        pullNotice.hide();
+        pullNotice = null;
       }
       settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
       settings.lastSyncStatus = "up-to-date";
       await this.saveSettings();
       this.statusBar.setStatus("up-to-date");
-      let pullMsg = `Google Drive Sync: Successfully downloaded ${downloadedCount} note(s)!`;
-      if (downloadedCount > 0 && localTrashedCount > 0) {
-        pullMsg = `Google Drive Sync: Downloaded ${downloadedCount} note(s), removed ${localTrashedCount} remote-deleted item(s).`;
+      await this.dashboard.recordHistory({
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        type: "pull",
+        filesCount: downloadedCount2,
+        status: "success"
+      });
+      let pullMsg = `Google Drive Sync: Successfully downloaded ${downloadedCount2} note(s)!`;
+      if (downloadedCount2 > 0 && localTrashedCount > 0) {
+        pullMsg = `Google Drive Sync: Downloaded ${downloadedCount2} note(s), removed ${localTrashedCount} remote-deleted item(s).`;
       } else if (localTrashedCount > 0) {
         pullMsg = `Google Drive Sync: Removed ${localTrashedCount} remote-deleted item(s).`;
       }
-      new import_obsidian4.Notice(pullMsg);
+      new import_obsidian5.Notice(pullMsg);
       if (hasUpdatedPluginsOrThemes) {
-        new import_obsidian4.Notice("Google Drive Sync: Plugins or themes were updated. Reload Obsidian (Ctrl/Cmd + R) to activate them.", 8e3);
+        new import_obsidian5.Notice("Google Drive Sync: Plugins or themes were updated. Reload Obsidian (Ctrl/Cmd + R) to activate them.", 8e3);
       }
     } catch (err) {
       const isOffline = ((_a = err.message) == null ? void 0 : _a.includes("NETWORK_OFFLINE")) || ((_b = err.message) == null ? void 0 : _b.includes("UnknownHostException")) || ((_c = err.message) == null ? void 0 : _c.includes("ENOTFOUND")) || ((_d = err.message) == null ? void 0 : _d.includes("Failed to fetch"));
@@ -1253,14 +1538,21 @@ var ManualSyncEngine = class {
         settings.lastSyncStatus = "offline";
         await this.saveSettings();
         this.statusBar.setStatus("offline");
-        new import_obsidian4.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
+        new import_obsidian5.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
         return;
       }
       console.error("Pull Error:", err);
       settings.lastSyncStatus = "failed";
       await this.saveSettings();
       this.statusBar.setStatus("failed");
-      new import_obsidian4.Notice(`Google Drive Pull failed: ${err.message}`);
+      await this.dashboard.recordHistory({
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        type: "pull",
+        filesCount: downloadedCount,
+        status: "failed",
+        error: err.message
+      });
+      new import_obsidian5.Notice(`Google Drive Pull failed: ${err.message}`);
     }
   }
   /**
@@ -1274,7 +1566,7 @@ var ManualSyncEngine = class {
         return new Uint8Array(buffer);
       }
       const abstractFile = this.app.vault.getAbstractFileByPath(cleanPath);
-      if (abstractFile instanceof import_obsidian4.TFile) {
+      if (abstractFile instanceof import_obsidian5.TFile) {
         const buffer = await this.app.vault.readBinary(abstractFile);
         return new Uint8Array(buffer);
       }
@@ -1300,7 +1592,7 @@ var ManualSyncEngine = class {
       return;
     }
     const existing = this.app.vault.getAbstractFileByPath(relativePath);
-    if (existing instanceof import_obsidian4.TFile) {
+    if (existing instanceof import_obsidian5.TFile) {
       await this.app.vault.modifyBinary(existing, arrayBuffer);
     } else {
       try {
@@ -1352,6 +1644,69 @@ var ManualSyncEngine = class {
     if (path.endsWith(".js")) return "application/javascript";
     return "application/octet-stream";
   }
+  /**
+   * Scans local vault and remote Google Drive tree to update VaultGlide Dashboard.md
+   * with pending new files, modified files, and deleted files.
+   */
+  async scanAndRefreshDashboard() {
+    await this.loadSettings();
+    const settings = this.getSettings();
+    if (!settings.accessToken) {
+      new import_obsidian5.Notice("VaultGlide: Please configure Google Drive in settings.");
+      await this.dashboard.writeDashboardNote();
+      return;
+    }
+    new import_obsidian5.Notice("VaultGlide: Scanning vault changes for dashboard...");
+    try {
+      const rootFolderId = await this.folderTree.getOrEnsureRootId();
+      const [localFiles, remoteMap] = await Promise.all([
+        this.hasher.scanVault(),
+        this.folderTree.scanRemoteVaultTree(rootFolderId)
+      ]);
+      const newFiles = [];
+      const modifiedFiles = [];
+      const localPathSet = /* @__PURE__ */ new Set();
+      for (const local of localFiles) {
+        const cleanPath = local.relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+        localPathSet.add(cleanPath);
+        const remote = remoteMap.get(cleanPath);
+        if (!remote) {
+          newFiles.push({ path: cleanPath, size: local.size });
+        } else {
+          const remoteSize = remote.size !== void 0 ? parseInt(remote.size, 10) : 0;
+          const cachedHash = settings.syncedFileHashes[cleanPath];
+          if (cachedHash && cachedHash === local.hash && remoteSize === local.size) {
+            continue;
+          }
+          modifiedFiles.push({ path: cleanPath, size: local.size });
+        }
+      }
+      const deletedFiles = [];
+      for (const trackedPath of Object.keys(settings.syncedFileHashes || {})) {
+        if (!localPathSet.has(trackedPath)) {
+          deletedFiles.push({ path: trackedPath });
+        }
+      }
+      await this.dashboard.writeDashboardNote({
+        newFiles,
+        modifiedFiles,
+        deletedFiles,
+        isSyncing: false
+      });
+      new import_obsidian5.Notice(`VaultGlide Dashboard: ${newFiles.length} new, ${modifiedFiles.length} modified, ${deletedFiles.length} deleted.`);
+    } catch (err) {
+      console.warn("Dashboard scan error:", err);
+      await this.dashboard.writeDashboardNote();
+    }
+  }
+  /**
+   * Opens the VaultGlide Dashboard.md note in the active workspace and triggers a background scan.
+   */
+  async openOrCreateDashboardFile() {
+    await this.dashboard.openDashboardNote();
+    this.scanAndRefreshDashboard().catch(() => {
+    });
+  }
 };
 
 // src/ui/statusBar.ts
@@ -1398,8 +1753,8 @@ var StatusBarController = class {
 };
 
 // src/ui/settingsTab.ts
-var import_obsidian5 = require("obsidian");
-var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
+var import_obsidian6 = require("obsidian");
+var GoogleDriveSettingTab = class extends import_obsidian6.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -1415,11 +1770,11 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
     const isConnected = Boolean(this.plugin.settings.accessToken);
     const isSessionExpired = this.plugin.settings.lastSyncStatus === "unauthenticated";
     if (!isConnected) {
-      const connectSetting = new import_obsidian5.Setting(containerEl).setName("Connection Status: Not Connected").setDesc("Connect your personal Google Drive via the VaultGlide web portal to sync your notes across devices.").addButton(
+      const connectSetting = new import_obsidian6.Setting(containerEl).setName("Connection Status: Not Connected").setDesc("Connect your personal Google Drive via the VaultGlide web portal to sync your notes across devices.").addButton(
         (btn) => btn.setButtonText("Connect with VaultGlide").setCta().onClick(() => {
           const targetUrl = this.plugin.settings.serverRelayUrl || "http://localhost:5180";
           window.open(targetUrl, "_blank");
-          new import_obsidian5.Notice("Opening VaultGlide Web Portal in your browser...");
+          new import_obsidian6.Notice("Opening VaultGlide Web Portal in your browser...");
         })
       );
       connectSetting.settingEl.style.border = "1px solid var(--background-modifier-border)";
@@ -1427,11 +1782,11 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       connectSetting.settingEl.style.padding = "12px";
       connectSetting.settingEl.style.marginBottom = "16px";
     } else if (isSessionExpired) {
-      const expiredSetting = new import_obsidian5.Setting(containerEl).setName("\u26A0\uFE0F Session Expired / Re-authentication Needed").setDesc(`Your Google Drive token for ${this.plugin.settings.userEmail || "account"} needs to be renewed.`).addButton(
+      const expiredSetting = new import_obsidian6.Setting(containerEl).setName("\u26A0\uFE0F Session Expired / Re-authentication Needed").setDesc(`Your Google Drive token for ${this.plugin.settings.userEmail || "account"} needs to be renewed.`).addButton(
         (btn) => btn.setButtonText("Re-authenticate on Web").setWarning().onClick(() => {
           const targetUrl = this.plugin.settings.serverRelayUrl || "http://localhost:5180";
           window.open(targetUrl, "_blank");
-          new import_obsidian5.Notice("Opening VaultGlide to renew connection...");
+          new import_obsidian6.Notice("Opening VaultGlide to renew connection...");
         })
       ).addButton(
         (btn) => btn.setButtonText("Disconnect").onClick(async () => {
@@ -1443,7 +1798,7 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       expiredSetting.settingEl.style.padding = "12px";
       expiredSetting.settingEl.style.marginBottom = "16px";
     } else {
-      const connectedSetting = new import_obsidian5.Setting(containerEl).setName(`\u{1F7E2} Connected: ${this.plugin.settings.userEmail || "Google User"}`).setDesc(`Cloud Vault: Google Drive/VaultGlide/${this.plugin.settings.vaultName}`).addButton(
+      const connectedSetting = new import_obsidian6.Setting(containerEl).setName(`\u{1F7E2} Connected: ${this.plugin.settings.userEmail || "Google User"}`).setDesc(`Cloud Vault: Google Drive/VaultGlide/${this.plugin.settings.vaultName}`).addButton(
         (btn) => btn.setButtonText("Push Notes").setCta().onClick(async () => {
           await this.plugin.syncEngine.push();
         })
@@ -1462,13 +1817,13 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       connectedSetting.settingEl.style.marginBottom = "16px";
     }
     containerEl.createEl("h3", { text: "Vault & Storage Settings" });
-    new import_obsidian5.Setting(containerEl).setName("Cloud Vault Folder Name").setDesc("Folder created inside your personal Google Drive (My Drive/VaultGlide/<VaultName>)").addText(
+    new import_obsidian6.Setting(containerEl).setName("Cloud Vault Folder Name").setDesc("Folder created inside your personal Google Drive (My Drive/VaultGlide/<VaultName>)").addText(
       (text) => text.setPlaceholder("MyVault").setValue(this.plugin.settings.vaultName).onChange(async (value) => {
         this.plugin.settings.vaultName = value.trim() || "MyVault";
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian5.Setting(containerEl).setName("VaultGlide Web Portal URL").setDesc("The web companion dashboard URL for web viewing and initial authentication.").addText(
+    new import_obsidian6.Setting(containerEl).setName("VaultGlide Web Portal URL").setDesc("The web companion dashboard URL for web viewing and initial authentication.").addText(
       (text) => text.setPlaceholder("http://localhost:5180").setValue(this.plugin.settings.serverRelayUrl).onChange(async (value) => {
         this.plugin.settings.serverRelayUrl = value.trim();
         await this.plugin.saveSettings();
@@ -1479,7 +1834,7 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       text: "Synchronize Obsidian preferences, themes, and community plugins across your devices via Google Drive.",
       cls: "setting-item-description"
     });
-    new import_obsidian5.Setting(containerEl).setName("Sync Configuration & Plugins (.obsidian)").setDesc("Master toggle: Scan and synchronize files inside the .obsidian folder.").addToggle(
+    new import_obsidian6.Setting(containerEl).setName("Sync Configuration & Plugins (.obsidian)").setDesc("Master toggle: Scan and synchronize files inside the .obsidian folder.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.syncConfigDir).onChange(async (val) => {
         this.plugin.settings.syncConfigDir = val;
         await this.plugin.saveSettings();
@@ -1487,25 +1842,25 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       })
     );
     if (this.plugin.settings.syncConfigDir) {
-      new import_obsidian5.Setting(containerEl).setName("Sync Core Settings & Hotkeys").setDesc("Sync general app preferences, file options, and hotkeys (app.json, hotkeys.json).").addToggle(
+      new import_obsidian6.Setting(containerEl).setName("Sync Core Settings & Hotkeys").setDesc("Sync general app preferences, file options, and hotkeys (app.json, hotkeys.json).").addToggle(
         (toggle) => toggle.setValue(this.plugin.settings.syncCoreSettings).onChange(async (val) => {
           this.plugin.settings.syncCoreSettings = val;
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian5.Setting(containerEl).setName("Sync Themes & CSS Snippets").setDesc("Sync active theme, custom styles, and snippets (appearance.json, snippets/).").addToggle(
+      new import_obsidian6.Setting(containerEl).setName("Sync Themes & CSS Snippets").setDesc("Sync active theme, custom styles, and snippets (appearance.json, snippets/).").addToggle(
         (toggle) => toggle.setValue(this.plugin.settings.syncAppearance).onChange(async (val) => {
           this.plugin.settings.syncAppearance = val;
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian5.Setting(containerEl).setName("Sync Community Plugins").setDesc("Sync installed community plugins and settings. (VaultGlide credentials are automatically excluded for safety).").addToggle(
+      new import_obsidian6.Setting(containerEl).setName("Sync Community Plugins").setDesc("Sync installed community plugins and settings. (VaultGlide credentials are automatically excluded for safety).").addToggle(
         (toggle) => toggle.setValue(this.plugin.settings.syncCommunityPlugins).onChange(async (val) => {
           this.plugin.settings.syncCommunityPlugins = val;
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian5.Setting(containerEl).setName("Sync Workspace Layout (Open Tabs)").setDesc("Sync open tabs and panes (workspace.json). Recommended: OFF if syncing between Desktop and Mobile.").addToggle(
+      new import_obsidian6.Setting(containerEl).setName("Sync Workspace Layout (Open Tabs)").setDesc("Sync open tabs and panes (workspace.json). Recommended: OFF if syncing between Desktop and Mobile.").addToggle(
         (toggle) => toggle.setValue(this.plugin.settings.syncWorkspaceLayout).onChange(async (val) => {
           this.plugin.settings.syncWorkspaceLayout = val;
           await this.plugin.saveSettings();
@@ -1513,7 +1868,7 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
       );
     }
     containerEl.createEl("h3", { text: "Sync Ignore Rules" });
-    new import_obsidian5.Setting(containerEl).setName("Custom Ignored Regex Patterns").setDesc("Enter one regex pattern per line to exclude files/folders from sync (e.g. ^Private/ or \\.secret$)").addTextArea(
+    new import_obsidian6.Setting(containerEl).setName("Custom Ignored Regex Patterns").setDesc("Enter one regex pattern per line to exclude files/folders from sync (e.g. ^Private/ or \\.secret$)").addTextArea(
       (text) => text.setPlaceholder("^Private/\n\\.secret$").setValue(this.plugin.settings.customIgnoredPatterns.join("\n")).onChange(async (value) => {
         this.plugin.settings.customIgnoredPatterns = value.split("\n").map((s) => s.trim()).filter(Boolean);
         await this.plugin.saveSettings();
@@ -1528,13 +1883,13 @@ var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
     this.plugin.settings.lastSyncStatus = "unauthenticated";
     await this.plugin.saveSettings();
     this.plugin.statusBar.setStatus("unauthenticated");
-    new import_obsidian5.Notice("Disconnected from Google Drive");
+    new import_obsidian6.Notice("Disconnected from Google Drive");
     this.display();
   }
 };
 
 // src/main.ts
-var GoogleDriveSyncPlugin = class extends import_obsidian6.Plugin {
+var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -1628,11 +1983,28 @@ var GoogleDriveSyncPlugin = class extends import_obsidian6.Plugin {
         }
       })
     );
+    this.addRibbonIcon("gauge", "VaultGlide Sync Dashboard", async () => {
+      await this.syncEngine.openOrCreateDashboardFile();
+    });
     this.addRibbonIcon("upload-cloud", "Push to Google Drive", async () => {
       await this.syncEngine.push();
     });
     this.addRibbonIcon("download-cloud", "Pull from Google Drive", async () => {
       await this.syncEngine.pull();
+    });
+    this.addCommand({
+      id: "vaultglide-open-dashboard",
+      name: "Open Sync Dashboard",
+      callback: async () => {
+        await this.syncEngine.openOrCreateDashboardFile();
+      }
+    });
+    this.addCommand({
+      id: "vaultglide-refresh-dashboard",
+      name: "Scan & Refresh Sync Dashboard",
+      callback: async () => {
+        await this.syncEngine.scanAndRefreshDashboard();
+      }
     });
     this.addCommand({
       id: "gdrive-push",
@@ -1648,7 +2020,42 @@ var GoogleDriveSyncPlugin = class extends import_obsidian6.Plugin {
         await this.syncEngine.pull();
       }
     });
+    this.registerMarkdownCodeBlockProcessor("vaultglide-actions", (source, el, ctx) => {
+      el.empty();
+      const bar = el.createDiv({ cls: "vaultglide-actions-bar" });
+      bar.style.display = "flex";
+      bar.style.flexWrap = "wrap";
+      bar.style.gap = "8px";
+      bar.style.margin = "12px 0";
+      const pushBtn = bar.createEl("button", {
+        text: "\u2B06\uFE0F Push to Drive",
+        cls: "mod-cta"
+      });
+      pushBtn.style.padding = "8px 16px";
+      pushBtn.style.fontWeight = "bold";
+      pushBtn.onclick = async () => {
+        await this.syncEngine.push();
+      };
+      const pullBtn = bar.createEl("button", {
+        text: "\u2B07\uFE0F Pull from Drive"
+      });
+      pullBtn.style.padding = "8px 16px";
+      pullBtn.onclick = async () => {
+        await this.syncEngine.pull();
+      };
+      const scanBtn = bar.createEl("button", {
+        text: "\u{1F504} Refresh & Scan"
+      });
+      scanBtn.style.padding = "8px 16px";
+      scanBtn.onclick = async () => {
+        await this.syncEngine.scanAndRefreshDashboard();
+      };
+    });
     this.addSettingTab(new GoogleDriveSettingTab(this.app, this));
+    setTimeout(() => {
+      this.syncEngine.dashboard.writeDashboardNote().catch(() => {
+      });
+    }, 1500);
   }
   async onunload() {
   }

@@ -19,6 +19,16 @@ export interface GoogleDrivePluginSettings {
   syncAppearance: boolean;
   syncCommunityPlugins: boolean;
   syncWorkspaceLayout: boolean;
+  syncHistory?: SyncHistoryEntry[];
+}
+
+export interface SyncHistoryEntry {
+  timestamp: string;
+  type: 'push' | 'pull';
+  filesCount: number;
+  trashedCount?: number;
+  status: 'success' | 'failed';
+  error?: string;
 }
 
 export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
@@ -41,6 +51,7 @@ export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
   syncAppearance: true,
   syncCommunityPlugins: true,
   syncWorkspaceLayout: false,
+  syncHistory: [],
 };
 
 export interface LocalFileHash {

@@ -119,6 +119,10 @@ export default class GoogleDriveSyncPlugin extends Plugin {
     );
 
     // 6. Register Ribbon Icons
+    this.addRibbonIcon('gauge', 'VaultGlide Sync Dashboard', async () => {
+      await this.syncEngine.openOrCreateDashboardFile();
+    });
+
     this.addRibbonIcon('upload-cloud', 'Push to Google Drive', async () => {
       await this.syncEngine.push();
     });
@@ -128,6 +132,22 @@ export default class GoogleDriveSyncPlugin extends Plugin {
     });
 
     // 7. Register Commands (with optional hotkeys)
+    this.addCommand({
+      id: 'vaultglide-open-dashboard',
+      name: 'Open Sync Dashboard',
+      callback: async () => {
+        await this.syncEngine.openOrCreateDashboardFile();
+      },
+    });
+
+    this.addCommand({
+      id: 'vaultglide-refresh-dashboard',
+      name: 'Scan & Refresh Sync Dashboard',
+      callback: async () => {
+        await this.syncEngine.scanAndRefreshDashboard();
+      },
+    });
+
     this.addCommand({
       id: 'gdrive-push',
       name: 'Push vault to Google Drive',
@@ -144,8 +164,49 @@ export default class GoogleDriveSyncPlugin extends Plugin {
       },
     });
 
-    // 8. Register Settings Tab
+    // 8. Register Interactive Dashboard Codeblock Processor
+    this.registerMarkdownCodeBlockProcessor('vaultglide-actions', (source, el, ctx) => {
+      el.empty();
+      const bar = el.createDiv({ cls: 'vaultglide-actions-bar' });
+      bar.style.display = 'flex';
+      bar.style.flexWrap = 'wrap';
+      bar.style.gap = '8px';
+      bar.style.margin = '12px 0';
+
+      const pushBtn = bar.createEl('button', {
+        text: '⬆️ Push to Drive',
+        cls: 'mod-cta',
+      });
+      pushBtn.style.padding = '8px 16px';
+      pushBtn.style.fontWeight = 'bold';
+      pushBtn.onclick = async () => {
+        await this.syncEngine.push();
+      };
+
+      const pullBtn = bar.createEl('button', {
+        text: '⬇️ Pull from Drive',
+      });
+      pullBtn.style.padding = '8px 16px';
+      pullBtn.onclick = async () => {
+        await this.syncEngine.pull();
+      };
+
+      const scanBtn = bar.createEl('button', {
+        text: '🔄 Refresh & Scan',
+      });
+      scanBtn.style.padding = '8px 16px';
+      scanBtn.onclick = async () => {
+        await this.syncEngine.scanAndRefreshDashboard();
+      };
+    });
+
+    // 9. Register Settings Tab
     this.addSettingTab(new GoogleDriveSettingTab(this.app, this));
+
+    // Auto-initialize dashboard note on startup in background
+    setTimeout(() => {
+      this.syncEngine.dashboard.writeDashboardNote().catch(() => {});
+    }, 1500);
   }
 
   async onunload() {

@@ -10,9 +10,13 @@ export const DEFAULT_IGNORED_PATTERNS = [
   '^Thumbs\.db$',
   '~$',
   '\.tmp$',
+  '^VaultGlide Dashboard\.md$',
 ];
 
 export class LocalHasher {
+  // In-memory cache mapping relativePath -> { mtime, size, hash } to skip flash storage reads
+  private metaCache: Map<string, { mtime: number; size: number; hash: string }> = new Map();
+
   constructor(
     private vault: Vault,
     private getSettings: () => GoogleDrivePluginSettings
@@ -34,6 +38,8 @@ export class LocalHasher {
    */
   public isIgnored(path: string): boolean {
     const clean = path.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (clean === 'VaultGlide Dashboard.md') return true;
+
     const configDir = (this.vault as any).configDir || '.obsidian';
 
     if (isConfigDirFile(clean, configDir)) {
@@ -85,7 +91,7 @@ export class LocalHasher {
 
   /**
    * Scans all non-ignored vault files and eligible .obsidian config files,
-   * computing their hashes in parallel chunks.
+   * computing their hashes with fast mtime & size caching.
    */
   public async scanVault(): Promise<LocalFileHash[]> {
     const settings = this.getSettings();
@@ -102,10 +108,25 @@ export class LocalHasher {
       const batchEntries = await Promise.all(
         batch.map(async (file) => {
           try {
+            const cleanPath = file.path.replace(/\\/g, '/').replace(/^\/+/, '');
+            const cached = this.metaCache.get(cleanPath);
+
+            // Fast-path: If mtime and size match cache, reuse hash immediately without reading disk!
+            if (cached && cached.mtime === file.stat.mtime && cached.size === file.stat.size) {
+              return {
+                relativePath: cleanPath,
+                hash: cached.hash,
+                size: cached.size,
+                mtime: cached.mtime,
+              };
+            }
+
             const data = await this.vault.readBinary(file);
             const hash = await this.computeHash(data);
+            this.metaCache.set(cleanPath, { mtime: file.stat.mtime, size: file.stat.size, hash });
+
             return {
-              relativePath: file.path.replace(/\\/g, '/').replace(/^\/+/, ''),
+              relativePath: cleanPath,
               hash,
               size: file.stat.size,
               mtime: file.stat.mtime,

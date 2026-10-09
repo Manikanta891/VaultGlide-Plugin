@@ -115,16 +115,21 @@ export class FolderTreeManager {
 
     const traverse = async (folderId: string, currentPathPrefix: string) => {
       const items = await this.client.listFolderChildren(folderId);
+      const subfolderTasks: Promise<void>[] = [];
 
       for (const item of items) {
         const itemRelativePath = currentPathPrefix ? `${currentPathPrefix}/${item.name}` : item.name;
 
         if (item.mimeType === 'application/vnd.google-apps.folder') {
           this.folderIdCache.set(itemRelativePath, item.id);
-          await traverse(item.id, itemRelativePath);
+          subfolderTasks.push(traverse(item.id, itemRelativePath));
         } else {
           fileMap.set(itemRelativePath, item);
         }
+      }
+
+      if (subfolderTasks.length > 0) {
+        await Promise.all(subfolderTasks);
       }
     };
 
