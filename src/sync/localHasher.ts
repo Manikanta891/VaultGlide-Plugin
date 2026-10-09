@@ -10,6 +10,7 @@ export const DEFAULT_IGNORED_PATTERNS = [
   '^Thumbs\.db$',
   '~$',
   '\.tmp$',
+  '^\.vaultglide($|\/)',
   '^VaultGlide Dashboard\.md$',
 ];
 
@@ -53,7 +54,7 @@ export class LocalHasher {
    */
   public isIgnored(path: string): boolean {
     const clean = path.replace(/\\/g, '/').replace(/^\/+/, '');
-    if (clean === 'VaultGlide Dashboard.md') return true;
+    if (clean === 'VaultGlide Dashboard.md' || clean === '.vaultglide' || clean.startsWith('.vaultglide/')) return true;
 
     const configDir = (this.vault as any).configDir || '.obsidian';
 

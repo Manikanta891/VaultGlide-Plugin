@@ -812,6 +812,7 @@ var DEFAULT_IGNORED_PATTERNS = [
   "^Thumbs.db$",
   "~$",
   ".tmp$",
+  "^.vaultglide($|/)",
   "^VaultGlide Dashboard.md$"
 ];
 var LocalHasher = class {
@@ -851,7 +852,7 @@ var LocalHasher = class {
    */
   isIgnored(path) {
     const clean = path.replace(/\\/g, "/").replace(/^\/+/, "");
-    if (clean === "VaultGlide Dashboard.md") return true;
+    if (clean === "VaultGlide Dashboard.md" || clean === ".vaultglide" || clean.startsWith(".vaultglide/")) return true;
     const configDir = this.vault.configDir || ".obsidian";
     if (isConfigDirFile(clean, configDir)) {
       const settings = this.getSettings();
@@ -1185,8 +1186,8 @@ var DashboardNoteManager = _DashboardNoteManager;
 // src/sync/manualSyncEngine.ts
 function formatNoticeFilename(filename) {
   const clean = filename.split("/").pop() || filename;
-  if (clean.length <= 22) return clean;
-  return `${clean.slice(0, 10)}...${clean.slice(-10)}`;
+  if (clean.length <= 16) return clean;
+  return `${clean.slice(0, 8)}...${clean.slice(-5)}`;
 }
 var ManualSyncEngine = class {
   constructor(app, getSettings, loadSettings, saveSettings, client, offlineTracker, statusBar) {
@@ -1210,6 +1211,61 @@ var ManualSyncEngine = class {
       },
       () => this.getSettings().vaultName
     );
+  }
+  /**
+   * Fetches the cloud manifest (.vaultglide/manifest.json) from Google Drive if present.
+   * Maps relativePath -> SHA-256 hash.
+   */
+  async fetchCloudManifest(remoteMap) {
+    const manifestRemote = remoteMap.get(".vaultglide/manifest.json");
+    if (!manifestRemote) return {};
+    try {
+      const buf = await this.client.downloadFileContent(manifestRemote.id);
+      const text = new TextDecoder("utf-8").decode(buf);
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.files === "object" && parsed.files !== null) {
+        return parsed.files;
+      }
+      return {};
+    } catch (e) {
+      console.warn("Could not read cloud manifest:", e);
+      return {};
+    }
+  }
+  /**
+   * Persists the current known file hashes to Google Drive (.vaultglide/manifest.json)
+   * so other connected devices can immediately recognize untouched files.
+   */
+  async saveCloudManifest(remoteMap) {
+    var _a, _b;
+    try {
+      const settings = this.getSettings();
+      const manifestData = {
+        vaultName: settings.vaultName,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        deviceId: settings.deviceId,
+        files: settings.syncedFileHashes || {}
+      };
+      const manifestJson = JSON.stringify(manifestData, null, 2);
+      const manifestBytes = new TextEncoder().encode(manifestJson);
+      const parentFolderId = await this.folderTree.ensureDirectoryPath(".vaultglide");
+      let existingFileId = void 0;
+      if (remoteMap) {
+        existingFileId = (_a = remoteMap.get(".vaultglide/manifest.json")) == null ? void 0 : _a.id;
+      }
+      if (!existingFileId) {
+        const rootId = await this.folderTree.getOrEnsureRootId();
+        const scan = await this.folderTree.scanRemoteVaultTree(rootId);
+        existingFileId = (_b = scan.get(".vaultglide/manifest.json")) == null ? void 0 : _b.id;
+      }
+      if (existingFileId) {
+        await this.client.updateFileContent(existingFileId, "application/json", manifestBytes);
+      } else {
+        await this.client.uploadNewFile("manifest.json", parentFolderId, "application/json", manifestBytes);
+      }
+    } catch (e) {
+      console.warn("Failed to save cloud manifest:", e);
+    }
   }
   /**
    * PUSH: High-Speed Parallel Upload of local vault changes directly to Google Drive.
@@ -1246,6 +1302,7 @@ var ManualSyncEngine = class {
         this.hasher.scanVault(),
         this.folderTree.scanRemoteVaultTree(rootFolderId)
       ]);
+      const cloudManifest = await this.fetchCloudManifest(remoteMap);
       const toUpload = [];
       const localPathSet = /* @__PURE__ */ new Set();
       for (const local of localFiles) {
@@ -1257,13 +1314,17 @@ var ManualSyncEngine = class {
         } else {
           const remoteSize = remote.size !== void 0 ? parseInt(remote.size, 10) : 0;
           const cachedHash = settings.syncedFileHashes[cleanPath];
-          if (cachedHash && cachedHash === local.hash) {
+          const cloudHash = cloudManifest[cleanPath];
+          if (cachedHash && cachedHash === local.hash || cloudHash && cloudHash === local.hash) {
+            if (!cachedHash && cloudHash === local.hash) {
+              settings.syncedFileHashes[cleanPath] = local.hash;
+            }
             continue;
           }
           const isSizeExact = remoteSize === local.size;
           const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
           const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
-          if ((isSizeExact || isSizeClose) && !cachedHash) {
+          if ((isSizeExact || isSizeClose) && !cachedHash && !cloudHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs2 = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
             if (local.mtime <= remoteTime + 3e3 || lastSyncMs2 > 0 && local.mtime <= lastSyncMs2 + 3e3) {
@@ -1424,6 +1485,7 @@ var ManualSyncEngine = class {
       await this.saveSettings();
       await this.offlineTracker.clearPendingChanges();
       this.statusBar.setStatus("up-to-date");
+      await this.saveCloudManifest(remoteMap);
       await this.dashboard.recordHistory({
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         type: "push",
@@ -1638,6 +1700,7 @@ var ManualSyncEngine = class {
       settings.lastSyncStatus = "up-to-date";
       await this.saveSettings();
       this.statusBar.setStatus("up-to-date");
+      await this.saveCloudManifest(remoteMap);
       await this.dashboard.recordHistory({
         timestamp: (/* @__PURE__ */ new Date()).toISOString(),
         type: "pull",
@@ -1793,6 +1856,7 @@ var ManualSyncEngine = class {
         this.hasher.scanVault(),
         this.folderTree.scanRemoteVaultTree(rootFolderId)
       ]);
+      const cloudManifest = await this.fetchCloudManifest(remoteMap);
       const newFiles = [];
       const modifiedFiles = [];
       const localPathSet = /* @__PURE__ */ new Set();
@@ -1805,13 +1869,17 @@ var ManualSyncEngine = class {
         } else {
           const remoteSize = remote.size !== void 0 ? parseInt(remote.size, 10) : 0;
           const cachedHash = settings.syncedFileHashes[cleanPath];
-          if (cachedHash && cachedHash === local.hash) {
+          const cloudHash = cloudManifest[cleanPath];
+          if (cachedHash && cachedHash === local.hash || cloudHash && cloudHash === local.hash) {
+            if (!cachedHash && cloudHash === local.hash) {
+              settings.syncedFileHashes[cleanPath] = local.hash;
+            }
             continue;
           }
           const isSizeExact = remoteSize === local.size;
           const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
           const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
-          if (isSizeExact || isSizeClose) {
+          if ((isSizeExact || isSizeClose) && !cachedHash && !cloudHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
             const isLocalUntouched = local.mtime <= remoteTime + 3e3 || lastSyncMs > 0 && local.mtime <= lastSyncMs + 3e3;
