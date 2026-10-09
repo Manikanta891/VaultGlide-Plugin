@@ -1,9 +1,9 @@
 {
-  "id": "obsidian-sync",
-  "name": "Obsidian Sync",
+  "id": "vaultglide",
+  "name": "VaultGlide — Cloud Sync & Web Companion",
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
-  "description": "Sync your notes directly to your personal Google Drive account. Zero server database storage, manual Push/Pull, 100% private.",
+  "description": "Sync your notes directly to your personal Google Drive account and view them seamlessly on the web. Zero server storage, manual Push/Pull, 100% private.",
   "author": "Manikanta",
   "authorUrl": "https://github.com/Manikanta891",
   "fundingUrl": "https://github.com/sponsors/Manikanta891",

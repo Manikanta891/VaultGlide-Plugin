@@ -36,15 +36,37 @@ export class OfflineTracker {
 
   public async trackFileModification(path: string): Promise<void> {
     const settings = this.getSettings();
+    if (!settings.pendingOfflineChanges) {
+      settings.pendingOfflineChanges = [];
+    }
     if (!settings.pendingOfflineChanges.includes(path)) {
       settings.pendingOfflineChanges.push(path);
       await this.saveSettings();
     }
   }
 
+  public async trackFileDeletion(path: string): Promise<void> {
+    const settings = this.getSettings();
+    if (!settings.pendingDeletedPaths) {
+      settings.pendingDeletedPaths = [];
+    }
+    if (!settings.pendingDeletedPaths.includes(path)) {
+      settings.pendingDeletedPaths.push(path);
+    }
+    // Remove from pendingOfflineChanges if it was modified prior to deletion
+    if (settings.pendingOfflineChanges) {
+      const idx = settings.pendingOfflineChanges.indexOf(path);
+      if (idx !== -1) {
+        settings.pendingOfflineChanges.splice(idx, 1);
+      }
+    }
+    await this.saveSettings();
+  }
+
   public async clearPendingChanges(): Promise<void> {
     const settings = this.getSettings();
     settings.pendingOfflineChanges = [];
+    settings.pendingDeletedPaths = [];
     await this.saveSettings();
   }
 }

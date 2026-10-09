@@ -1,14 +1,14 @@
 {
-  "name": "obsidian-google-drive-sync",
+  "name": "vaultglide",
   "version": "1.0.0",
-  "description": "Direct, manual, and private cloud synchronization for Obsidian vaults via personal Google Drive",
+  "description": "Direct, manual, and private cloud synchronization for Obsidian vaults via personal Google Drive with web companion access",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production"
   },
-  "keywords": ["obsidian", "obsidian-plugin", "google-drive", "cloud-sync", "sync"],
-  "author": "Obsidian Cloud Sync",
+  "keywords": ["obsidian", "obsidian-plugin", "google-drive", "cloud-sync", "sync", "vaultglide", "web-viewer"],
+  "author": "Manikanta",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.12.12",

@@ -78,6 +78,46 @@ export default class GoogleDriveSyncPlugin extends Plugin {
       })
     );
 
+    this.registerEvent(
+      this.app.vault.on('delete', (file) => {
+        const cleanPath = file.path.replace(/\\/g, '/').replace(/^\/+/, '');
+        this.offlineTracker.trackFileDeletion(cleanPath);
+        if (this.settings.syncedFileHashes) {
+          const folderPrefix = cleanPath.endsWith('/') ? cleanPath : `${cleanPath}/`;
+          for (const trackedPath of Object.keys(this.settings.syncedFileHashes)) {
+            if (trackedPath.startsWith(folderPrefix)) {
+              this.offlineTracker.trackFileDeletion(trackedPath);
+            }
+          }
+        }
+        if (this.settings.lastSyncStatus === 'up-to-date') {
+          this.settings.lastSyncStatus = 'local-changes';
+          this.statusBar.setStatus('local-changes');
+        }
+      })
+    );
+
+    this.registerEvent(
+      this.app.vault.on('rename', (file, oldPath) => {
+        const cleanOld = oldPath.replace(/\\/g, '/').replace(/^\/+/, '');
+        const cleanNew = file.path.replace(/\\/g, '/').replace(/^\/+/, '');
+        this.offlineTracker.trackFileDeletion(cleanOld);
+        this.offlineTracker.trackFileModification(cleanNew);
+        if (this.settings.syncedFileHashes) {
+          const folderOldPrefix = cleanOld.endsWith('/') ? cleanOld : `${cleanOld}/`;
+          for (const trackedPath of Object.keys(this.settings.syncedFileHashes)) {
+            if (trackedPath.startsWith(folderOldPrefix)) {
+              this.offlineTracker.trackFileDeletion(trackedPath);
+            }
+          }
+        }
+        if (this.settings.lastSyncStatus === 'up-to-date') {
+          this.settings.lastSyncStatus = 'local-changes';
+          this.statusBar.setStatus('local-changes');
+        }
+      })
+    );
+
     // 6. Register Ribbon Icons
     this.addRibbonIcon('upload-cloud', 'Push to Google Drive', async () => {
       await this.syncEngine.push();

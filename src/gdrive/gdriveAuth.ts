@@ -41,7 +41,7 @@ export class GDriveAuth {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refreshToken: settings.refreshToken }),
-        throwResponseError: false,
+        throw: false,
       });
 
       if (response.status === 200) {
@@ -72,7 +72,7 @@ export class GDriveAuth {
       url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
-      throwResponseError: false,
+      throw: false,
     });
 
     if (response.status === 200) {
@@ -112,7 +112,7 @@ export class GDriveAuth {
         expiryDate: settings.tokenExpiry,
         userEmail: settings.userEmail,
       }),
-      throwResponseError: false,
+      throw: false,
     });
 
     if (response.status === 201) {

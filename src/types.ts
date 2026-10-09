@@ -11,7 +11,14 @@ export interface GoogleDrivePluginSettings {
   lastSyncStatus: 'up-to-date' | 'local-changes' | 'cloud-newer' | 'syncing' | 'failed' | 'offline' | 'unauthenticated';
   customIgnoredPatterns: string[];
   pendingOfflineChanges: string[];
+  pendingDeletedPaths: string[];
   syncedFileHashes: Record<string, string>;
+  // .obsidian configuration and plugin sync toggles
+  syncConfigDir: boolean;
+  syncCoreSettings: boolean;
+  syncAppearance: boolean;
+  syncCommunityPlugins: boolean;
+  syncWorkspaceLayout: boolean;
 }
 
 export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
@@ -27,7 +34,13 @@ export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
   lastSyncStatus: 'unauthenticated',
   customIgnoredPatterns: [],
   pendingOfflineChanges: [],
+  pendingDeletedPaths: [],
   syncedFileHashes: {},
+  syncConfigDir: true,
+  syncCoreSettings: true,
+  syncAppearance: true,
+  syncCommunityPlugins: true,
+  syncWorkspaceLayout: false,
 };
 
 export interface LocalFileHash {

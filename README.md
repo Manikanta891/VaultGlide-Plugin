@@ -6,7 +6,7 @@
 
 ## 🌟 Key Highlights
 
-- **Zero Third-Party Storage**: Notes stream directly between your device and your personal Google Drive (`My Drive/ObsidianSync/`).
+- **Zero Third-Party Storage**: Notes stream directly between your device and your personal Google Drive (`My Drive/VaultGlide/`).
 - **Explicit Manual Control**:
   - 🔵 **Push Symbol**: Upload local vault notes and media to Google Drive.
   - 🟢 **Pull Symbol**: Download latest notes from Google Drive to your device.

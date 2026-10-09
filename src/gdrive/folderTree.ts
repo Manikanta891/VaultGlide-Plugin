@@ -19,8 +19,13 @@ export class FolderTreeManager {
     this.inFlightFolderCreation.clear();
   }
 
+  public getCachedFolderId(relativePath: string): string | undefined {
+    const clean = relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    return this.folderIdCache.get(clean);
+  }
+
   /**
-   * Returns a valid root vault folder ID, creating the My Drive/ObsidianSync/<VaultName> folder
+   * Returns a valid root vault folder ID, creating the My Drive/VaultGlide/<VaultName> folder
    * on Google Drive automatically if not already set.
    */
   public async getOrEnsureRootId(): Promise<string> {

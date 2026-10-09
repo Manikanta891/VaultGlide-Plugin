@@ -43,7 +43,13 @@ var DEFAULT_SETTINGS = {
   lastSyncStatus: "unauthenticated",
   customIgnoredPatterns: [],
   pendingOfflineChanges: [],
-  syncedFileHashes: {}
+  pendingDeletedPaths: [],
+  syncedFileHashes: {},
+  syncConfigDir: true,
+  syncCoreSettings: true,
+  syncAppearance: true,
+  syncCommunityPlugins: true,
+  syncWorkspaceLayout: false
 };
 
 // src/gdrive/gdriveAuth.ts
@@ -82,7 +88,7 @@ var GDriveAuth = class {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refreshToken: settings.refreshToken }),
-        throwResponseError: false
+        throw: false
       });
       if (response.status === 200) {
         const data = response.json;
@@ -110,7 +116,7 @@ var GDriveAuth = class {
       url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
       method: "GET",
       headers: { "Content-Type": "application/json" },
-      throwResponseError: false
+      throw: false
     });
     if (response.status === 200) {
       const data = response.json;
@@ -145,7 +151,7 @@ var GDriveAuth = class {
         expiryDate: settings.tokenExpiry,
         userEmail: settings.userEmail
       }),
-      throwResponseError: false
+      throw: false
     });
     if (response.status === 201) {
       return response.json;
@@ -157,6 +163,11 @@ var GDriveAuth = class {
 
 // src/gdrive/gdriveClient.ts
 var import_obsidian2 = require("obsidian");
+function escapeDriveQuery(str) {
+  return str.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+var RESUMABLE_UPLOAD_THRESHOLD = 5 * 1024 * 1024;
+var CHUNK_SIZE = 2 * 1024 * 1024;
 var GDriveClient = class {
   constructor(auth) {
     this.auth = auth;
@@ -166,7 +177,7 @@ var GDriveClient = class {
    * and exponential backoff retry on 429 (rate limits).
    */
   async request(url, options = {}, retryCount = 0) {
-    var _a;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     const token = await this.auth.getValidAccessToken();
     const headers = {
       Authorization: `Bearer ${token}`,
@@ -178,7 +189,7 @@ var GDriveClient = class {
         method: options.method || "GET",
         headers,
         body: options.body,
-        throwResponseError: false
+        throw: false
       });
       if ((response.status === 401 || response.status === 403) && retryCount === 0) {
         const refreshed = await this.auth.refreshAccessToken();
@@ -186,7 +197,7 @@ var GDriveClient = class {
           return this.request(url, options, retryCount + 1);
         }
       }
-      if (response.status === 429 && retryCount < 3) {
+      if ((response.status === 429 || response.status === 503) && retryCount < 3) {
         const delay = Math.pow(2, retryCount) * 1e3 + Math.random() * 500;
         await new Promise((resolve) => setTimeout(resolve, delay));
         return this.request(url, options, retryCount + 1);
@@ -198,36 +209,48 @@ var GDriveClient = class {
       }
       return response;
     } catch (err) {
-      if (retryCount === 0 && (err.message.includes("401") || err.message.includes("403"))) {
+      if (retryCount === 0 && (((_b = err.message) == null ? void 0 : _b.includes("401")) || ((_c = err.message) == null ? void 0 : _c.includes("403")))) {
         const refreshed = await this.auth.refreshAccessToken();
         if (refreshed) {
           return this.request(url, options, retryCount + 1);
         }
       }
+      const isNetworkError = ((_d = err.message) == null ? void 0 : _d.includes("UnknownHostException")) || ((_e = err.message) == null ? void 0 : _e.includes("ENOTFOUND")) || ((_f = err.message) == null ? void 0 : _f.includes("ECONNRESET")) || ((_g = err.message) == null ? void 0 : _g.includes("ETIMEDOUT")) || ((_h = err.message) == null ? void 0 : _h.includes("Failed to fetch")) || ((_i = err.message) == null ? void 0 : _i.includes("Network Error"));
+      if (isNetworkError && retryCount < 2) {
+        const delay = (retryCount + 1) * 1500;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return this.request(url, options, retryCount + 1);
+      }
+      if (isNetworkError) {
+        throw new Error("NETWORK_OFFLINE: Unable to reach Google Drive (DNS / network offline). Please check your internet connection.");
+      }
       throw err;
     }
   }
   /**
-   * Finds or creates the visible 'ObsidianSync/<vaultName>' folder in the user's Google Drive.
+   * Finds or creates the visible 'VaultGlide/<vaultName>' folder in the user's Google Drive.
+   * Prevents duplicate root folders across reconnects.
    */
   async ensureVaultRootFolder(vaultName) {
     var _a, _b;
     const sanitizedVaultName = vaultName.trim().replace(/[\/\\:*?"<>|]/g, "_") || "DefaultVault";
+    const escapedVaultName = escapeDriveQuery(sanitizedVaultName);
     const rootQuery = await this.request(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        "name = 'ObsidianSync' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'root' in parents"
-      )}&fields=files(id,name)`
+        "(name = 'VaultGlide' or name = 'ObsidianSync') and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+      )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
     );
     let rootFolderId;
     if (((_a = rootQuery.json) == null ? void 0 : _a.files) && rootQuery.json.files.length > 0) {
-      rootFolderId = rootQuery.json.files[0].id;
+      const primaryFolder = rootQuery.json.files.find((f) => f.name === "VaultGlide");
+      rootFolderId = (primaryFolder == null ? void 0 : primaryFolder.id) || rootQuery.json.files[0].id;
     } else {
-      rootFolderId = await this.createFolder("ObsidianSync", "root");
+      rootFolderId = await this.createFolder("VaultGlide", "root");
     }
     const vaultQuery = await this.request(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        `name = '${sanitizedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${rootFolderId}' in parents`
-      )}&fields=files(id,name)`
+        `name = '${escapedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${rootFolderId}' in parents`
+      )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
     );
     let vaultFolderId;
     if (((_b = vaultQuery.json) == null ? void 0 : _b.files) && vaultQuery.json.files.length > 0) {
@@ -268,9 +291,33 @@ var GDriveClient = class {
     return res.json.id;
   }
   /**
-   * Uploads a new file (including 0-byte empty files) to Google Drive via multipart upload.
+   * Uploads a new file (including 0-byte empty files and large media/videos) to Google Drive.
+   * - Files <= 5 MB: Fast multipart upload.
+   * - Files > 5 MB: Resumable chunked upload (prevents mobile OOM & handles network interruption).
    */
-  async uploadNewFile(name, parentId, mimeType, data) {
+  async uploadNewFile(name, parentId, mimeType, data, onProgress) {
+    const dataBytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (dataBytes.byteLength > RESUMABLE_UPLOAD_THRESHOLD) {
+      return this.uploadResumable(name, parentId, mimeType, dataBytes, false, onProgress);
+    }
+    return this.uploadMultipart(name, parentId, mimeType, dataBytes);
+  }
+  /**
+   * Updates an existing file's content in Google Drive.
+   * - Files <= 5 MB: Direct media PATCH.
+   * - Files > 5 MB: Resumable chunked upload.
+   */
+  async updateFileContent(fileId, mimeType, data, onProgress) {
+    const dataBytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (dataBytes.byteLength > RESUMABLE_UPLOAD_THRESHOLD) {
+      return this.uploadResumable("", fileId, mimeType, dataBytes, true, onProgress);
+    }
+    return this.updateMediaDirect(fileId, mimeType, dataBytes);
+  }
+  /**
+   * Fast Multipart upload for files <= 5 MB.
+   */
+  async uploadMultipart(name, parentId, mimeType, data) {
     const metadata = {
       name,
       parents: [parentId],
@@ -301,7 +348,7 @@ ${JSON.stringify(
     offset += metaBuffer.byteLength;
     combined.set(mediaHeaderBuffer, offset);
     offset += mediaHeaderBuffer.byteLength;
-    combined.set(new Uint8Array(data), offset);
+    combined.set(data, offset);
     offset += data.byteLength;
     combined.set(closeBuffer, offset);
     const url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
@@ -310,24 +357,153 @@ ${JSON.stringify(
       headers: {
         "Content-Type": `multipart/related; boundary=${boundary}`
       },
-      body: combined.buffer
+      body: combined.buffer.slice(combined.byteOffset, combined.byteOffset + combined.byteLength)
     });
     return res.json;
   }
   /**
-   * Updates an existing file's content in Google Drive (media PATCH).
-   * Seamlessly handles file modifications and appends.
+   * Direct Media PATCH for files <= 5 MB.
    */
-  async updateFileContent(fileId, mimeType, data) {
+  async updateMediaDirect(fileId, mimeType, data) {
     const url = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`;
     const res = await this.request(url, {
       method: "PATCH",
       headers: {
         "Content-Type": mimeType || "application/octet-stream"
       },
-      body: data
+      body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
     });
     return res.json;
+  }
+  /**
+   * Resumable Chunked Upload Protocol for large files & video:
+   * 1. Initiates resumable session with Google Drive.
+   * 2. Streams the file in 2 MB chunks (multiples of 256 KB).
+   * 3. Queries status and resumes upload seamlessly if any chunk drops.
+   */
+  async uploadResumable(name, targetId, mimeType, data, isUpdate, onProgress) {
+    const token = await this.auth.getValidAccessToken();
+    const totalBytes = data.byteLength;
+    const finalMime = mimeType || "application/octet-stream";
+    const initUrl = isUpdate ? `https://www.googleapis.com/upload/drive/v3/files/${targetId}?uploadType=resumable` : "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+    const metadata = isUpdate ? {} : {
+      name,
+      parents: [targetId],
+      mimeType: finalMime
+    };
+    const initRes = await (0, import_obsidian2.requestUrl)({
+      url: initUrl,
+      method: isUpdate ? "PATCH" : "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": finalMime,
+        "X-Upload-Content-Length": totalBytes.toString()
+      },
+      body: JSON.stringify(metadata),
+      throw: false
+    });
+    if (initRes.status >= 400) {
+      throw new Error(`Failed to initiate resumable upload session (HTTP ${initRes.status}): ${initRes.text || ""}`);
+    }
+    const sessionUri = initRes.headers["location"] || initRes.headers["Location"];
+    if (!sessionUri) {
+      throw new Error("Google Drive did not return a resumable session URI.");
+    }
+    let start = 0;
+    let lastResult = null;
+    while (start < totalBytes) {
+      const end = Math.min(start + CHUNK_SIZE - 1, totalBytes - 1);
+      const chunkLength = end - start + 1;
+      const chunkBytes = data.slice(start, end + 1);
+      const chunkBuffer = chunkBytes.buffer.slice(chunkBytes.byteOffset, chunkBytes.byteOffset + chunkBytes.byteLength);
+      let chunkSuccess = false;
+      let retryCount = 0;
+      while (!chunkSuccess && retryCount < 4) {
+        try {
+          const chunkRes = await (0, import_obsidian2.requestUrl)({
+            url: sessionUri,
+            method: "PUT",
+            headers: {
+              "Content-Range": `bytes ${start}-${end}/${totalBytes}`,
+              "Content-Length": chunkLength.toString()
+            },
+            body: chunkBuffer,
+            throw: false
+          });
+          if (chunkRes.status === 308) {
+            chunkSuccess = true;
+            start = end + 1;
+            if (onProgress) onProgress(start, totalBytes);
+          } else if (chunkRes.status === 200 || chunkRes.status === 201) {
+            chunkSuccess = true;
+            lastResult = chunkRes.json;
+            start = totalBytes;
+            if (onProgress) onProgress(totalBytes, totalBytes);
+          } else if (chunkRes.status >= 500 || chunkRes.status === 429) {
+            retryCount++;
+            const delay = Math.pow(2, retryCount) * 1e3 + Math.random() * 500;
+            await new Promise((r) => setTimeout(r, delay));
+            const resumedStart = await this.queryResumableStatus(sessionUri, totalBytes);
+            if (resumedStart !== null) {
+              start = resumedStart;
+              break;
+            }
+          } else {
+            throw new Error(`Resumable chunk upload failed (HTTP ${chunkRes.status}): ${chunkRes.text || ""}`);
+          }
+        } catch (err) {
+          retryCount++;
+          if (retryCount >= 4) throw err;
+          const delay = Math.pow(2, retryCount) * 1500;
+          await new Promise((r) => setTimeout(r, delay));
+          const resumedStart = await this.queryResumableStatus(sessionUri, totalBytes);
+          if (resumedStart !== null) {
+            start = resumedStart;
+            break;
+          }
+        }
+      }
+      if (!chunkSuccess && start < totalBytes) {
+        throw new Error(`Failed to upload chunk starting at byte ${start} after multiple retries.`);
+      }
+    }
+    if (!lastResult) {
+      const checkRes = await this.request(
+        `https://www.googleapis.com/drive/v3/files/${isUpdate ? targetId : "root"}?fields=id,name,mimeType,size,modifiedTime`
+      );
+      return checkRes.json;
+    }
+    return lastResult;
+  }
+  /**
+   * Queries Google Drive for the last byte successfully received in an interrupted resumable session.
+   */
+  async queryResumableStatus(sessionUri, totalBytes) {
+    try {
+      const res = await (0, import_obsidian2.requestUrl)({
+        url: sessionUri,
+        method: "PUT",
+        headers: {
+          "Content-Range": `bytes */${totalBytes}`
+        },
+        body: new ArrayBuffer(0),
+        throw: false
+      });
+      if (res.status === 308) {
+        const rangeHeader = res.headers["range"] || res.headers["Range"];
+        if (rangeHeader) {
+          const match = /bytes=0-(\d+)/.exec(rangeHeader);
+          if (match && match[1]) {
+            return parseInt(match[1], 10) + 1;
+          }
+        }
+        return 0;
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
   }
   /**
    * Downloads binary file data directly from Google Drive into an ArrayBuffer.
@@ -381,14 +557,34 @@ var OfflineTracker = class {
   }
   async trackFileModification(path) {
     const settings = this.getSettings();
+    if (!settings.pendingOfflineChanges) {
+      settings.pendingOfflineChanges = [];
+    }
     if (!settings.pendingOfflineChanges.includes(path)) {
       settings.pendingOfflineChanges.push(path);
       await this.saveSettings();
     }
   }
+  async trackFileDeletion(path) {
+    const settings = this.getSettings();
+    if (!settings.pendingDeletedPaths) {
+      settings.pendingDeletedPaths = [];
+    }
+    if (!settings.pendingDeletedPaths.includes(path)) {
+      settings.pendingDeletedPaths.push(path);
+    }
+    if (settings.pendingOfflineChanges) {
+      const idx = settings.pendingOfflineChanges.indexOf(path);
+      if (idx !== -1) {
+        settings.pendingOfflineChanges.splice(idx, 1);
+      }
+    }
+    await this.saveSettings();
+  }
   async clearPendingChanges() {
     const settings = this.getSettings();
     settings.pendingOfflineChanges = [];
+    settings.pendingDeletedPaths = [];
     await this.saveSettings();
   }
 };
@@ -412,8 +608,12 @@ var FolderTreeManager = class {
     this.folderIdCache.clear();
     this.inFlightFolderCreation.clear();
   }
+  getCachedFolderId(relativePath) {
+    const clean = relativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    return this.folderIdCache.get(clean);
+  }
   /**
-   * Returns a valid root vault folder ID, creating the My Drive/ObsidianSync/<VaultName> folder
+   * Returns a valid root vault folder ID, creating the My Drive/VaultGlide/<VaultName> folder
    * on Google Drive automatically if not already set.
    */
   async getOrEnsureRootId() {
@@ -493,22 +693,74 @@ var FolderTreeManager = class {
   }
 };
 
+// src/sync/configSyncFilter.ts
+function isConfigDirFile(path, configDir = ".obsidian") {
+  const cleanPath = path.replace(/\\/g, "/").replace(/^\/+/, "");
+  const cleanConfig = configDir.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  return cleanPath === cleanConfig || cleanPath.startsWith(`${cleanConfig}/`) || cleanPath.startsWith(".obsidian/");
+}
+function getRelativeConfigSubpath(path, configDir = ".obsidian") {
+  const cleanPath = path.replace(/\\/g, "/").replace(/^\/+/, "");
+  const cleanConfig = configDir.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  if (cleanPath.startsWith(`${cleanConfig}/`)) {
+    return cleanPath.substring(cleanConfig.length + 1);
+  }
+  if (cleanPath.startsWith(".obsidian/")) {
+    return cleanPath.substring(".obsidian/".length);
+  }
+  return cleanPath;
+}
+function shouldSyncConfigFile(path, configDir = ".obsidian", settings) {
+  if (!settings.syncConfigDir) {
+    return false;
+  }
+  const subpath = getRelativeConfigSubpath(path, configDir).toLowerCase();
+  if (subpath === "plugins/vaultglide/data.json" || subpath === "plugins/obsidian-google-drive/data.json" || subpath.startsWith("plugins/vaultglide/data.") || subpath.startsWith("plugins/obsidian-google-drive/data.")) {
+    return false;
+  }
+  if (subpath.startsWith("cache/") || subpath.startsWith(".trash/") || subpath.endsWith(".ds_store") || subpath.endsWith("thumbs.db") || subpath.endsWith(".tmp") || subpath.endsWith("~")) {
+    return false;
+  }
+  if (subpath === "workspace.json" || subpath === "workspace-mobile.json") {
+    return Boolean(settings.syncWorkspaceLayout);
+  }
+  if (subpath === "graph.json") {
+    return false;
+  }
+  if (subpath === "appearance.json" || subpath.startsWith("snippets/") || subpath.startsWith("themes/")) {
+    return Boolean(settings.syncAppearance);
+  }
+  if (subpath === "community-plugins.json" || subpath === "core-plugins.json" || subpath.startsWith("plugins/")) {
+    return Boolean(settings.syncCommunityPlugins);
+  }
+  if (subpath === "app.json" || subpath === "hotkeys.json" || subpath === "types.json") {
+    return Boolean(settings.syncCoreSettings);
+  }
+  if (!subpath.includes("/") && subpath.endsWith(".json")) {
+    return Boolean(settings.syncCoreSettings);
+  }
+  return false;
+}
+function isPluginOrThemeFile(path, configDir = ".obsidian") {
+  if (!isConfigDirFile(path, configDir)) return false;
+  const subpath = getRelativeConfigSubpath(path, configDir).toLowerCase();
+  return subpath.startsWith("plugins/") || subpath === "community-plugins.json" || subpath === "appearance.json" || subpath.startsWith("snippets/") || subpath.startsWith("themes/");
+}
+
 // src/sync/localHasher.ts
 var DEFAULT_IGNORED_PATTERNS = [
   "^.git($|/)",
   "^node_modules($|/)",
   "^.trash($|/)",
-  "^.obsidian/workspace",
-  "^.obsidian/cache",
   "^.DS_Store$",
   "^Thumbs.db$",
   "~$",
   ".tmp$"
 ];
 var LocalHasher = class {
-  constructor(vault, getCustomPatterns) {
+  constructor(vault, getSettings) {
     this.vault = vault;
-    this.getCustomPatterns = getCustomPatterns;
+    this.getSettings = getSettings;
   }
   /**
    * Computes SHA-256 hex string for binary buffer using Web Crypto API.
@@ -518,36 +770,74 @@ var LocalHasher = class {
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
+  /**
+   * Checks if a file path is ignored from syncing.
+   * - Config dir (.obsidian) paths are checked against granular user settings & blacklist.
+   * - Vault paths are checked against standard ignore patterns & custom user patterns.
+   */
   isIgnored(path) {
-    const custom = this.getCustomPatterns();
+    const clean = path.replace(/\\/g, "/").replace(/^\/+/, "");
+    const configDir = this.vault.configDir || ".obsidian";
+    if (isConfigDirFile(clean, configDir)) {
+      const settings = this.getSettings();
+      return !shouldSyncConfigFile(clean, configDir, settings);
+    }
+    const custom = this.getSettings().customIgnoredPatterns || [];
     const all = [...DEFAULT_IGNORED_PATTERNS, ...custom];
     for (const pat of all) {
       try {
         const reg = new RegExp(pat, "i");
-        if (reg.test(path)) return true;
+        if (reg.test(clean)) return true;
       } catch (e) {
       }
     }
     return false;
   }
   /**
-   * Scans all non-ignored vault files and computes their hashes in parallel chunks.
-   * Seamlessly handles empty 0-byte notes.
+   * Recursively discovers all files in Obsidian's hidden config directory (e.g. .obsidian).
+   */
+  async scanConfigDir(configDir) {
+    const collected = [];
+    const queue = [configDir];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      try {
+        const list = await this.vault.adapter.list(current);
+        if (list.files) {
+          for (const f of list.files) {
+            collected.push(f.replace(/\\/g, "/").replace(/^\/+/, ""));
+          }
+        }
+        if (list.folders) {
+          for (const d of list.folders) {
+            queue.push(d.replace(/\\/g, "/").replace(/^\/+/, ""));
+          }
+        }
+      } catch (e) {
+      }
+    }
+    return collected;
+  }
+  /**
+   * Scans all non-ignored vault files and eligible .obsidian config files,
+   * computing their hashes in parallel chunks.
    */
   async scanVault() {
-    const files = this.vault.getFiles();
-    const valid = files.filter((f) => !this.isIgnored(f.path));
+    const settings = this.getSettings();
+    const configDir = this.vault.configDir || ".obsidian";
     const result = [];
+    const vaultFiles = this.vault.getFiles();
+    const validVaultFiles = vaultFiles.filter((f) => !this.isIgnored(f.path));
     const BATCH_SIZE = 50;
-    for (let i = 0; i < valid.length; i += BATCH_SIZE) {
-      const batch = valid.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < validVaultFiles.length; i += BATCH_SIZE) {
+      const batch = validVaultFiles.slice(i, i + BATCH_SIZE);
       const batchEntries = await Promise.all(
         batch.map(async (file) => {
           try {
             const data = await this.vault.readBinary(file);
             const hash = await this.computeHash(data);
             return {
-              relativePath: file.path,
+              relativePath: file.path.replace(/\\/g, "/").replace(/^\/+/, ""),
               hash,
               size: file.stat.size,
               mtime: file.stat.mtime
@@ -559,6 +849,33 @@ var LocalHasher = class {
       );
       for (const entry of batchEntries) {
         if (entry) result.push(entry);
+      }
+    }
+    if (settings.syncConfigDir) {
+      const configPaths = await this.scanConfigDir(configDir);
+      const eligibleConfigPaths = configPaths.filter((p) => shouldSyncConfigFile(p, configDir, settings));
+      for (let i = 0; i < eligibleConfigPaths.length; i += BATCH_SIZE) {
+        const batch = eligibleConfigPaths.slice(i, i + BATCH_SIZE);
+        const batchEntries = await Promise.all(
+          batch.map(async (path) => {
+            try {
+              const data = await this.vault.adapter.readBinary(path);
+              const stat = await this.vault.adapter.stat(path);
+              const hash = await this.computeHash(data);
+              return {
+                relativePath: path,
+                hash,
+                size: (stat == null ? void 0 : stat.size) || data.byteLength,
+                mtime: (stat == null ? void 0 : stat.mtime) || Date.now()
+              };
+            } catch (e) {
+              return null;
+            }
+          })
+        );
+        for (const entry of batchEntries) {
+          if (entry) result.push(entry);
+        }
       }
     }
     return result;
@@ -575,7 +892,7 @@ var ManualSyncEngine = class {
     this.client = client;
     this.offlineTracker = offlineTracker;
     this.statusBar = statusBar;
-    this.hasher = new LocalHasher(app.vault, () => this.getSettings().customIgnoredPatterns);
+    this.hasher = new LocalHasher(app.vault, () => this.getSettings());
     this.folderTree = new FolderTreeManager(
       client,
       () => this.getSettings().vaultFolderId,
@@ -592,6 +909,7 @@ var ManualSyncEngine = class {
    * Modifies existing files in-place with zero duplicate creations.
    */
   async push() {
+    var _a, _b, _c, _d;
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
@@ -614,8 +932,10 @@ var ManualSyncEngine = class {
         this.folderTree.scanRemoteVaultTree(rootFolderId)
       ]);
       const toUpload = [];
+      const localPathSet = /* @__PURE__ */ new Set();
       for (const local of localFiles) {
         const cleanPath = local.relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+        localPathSet.add(cleanPath);
         const remote = remoteMap.get(cleanPath);
         if (!remote) {
           toUpload.push({ local });
@@ -635,7 +955,38 @@ var ManualSyncEngine = class {
           toUpload.push({ local, remote });
         }
       }
-      if (toUpload.length === 0) {
+      const deletedToTrash = [];
+      const pendingDeletions = new Set(settings.pendingDeletedPaths || []);
+      for (const trackedPath of Object.keys(settings.syncedFileHashes)) {
+        if (!localPathSet.has(trackedPath)) {
+          pendingDeletions.add(trackedPath);
+        }
+      }
+      const pendingDeletionList = Array.from(pendingDeletions);
+      const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+      for (const [remotePath, remoteFile] of remoteMap.entries()) {
+        if (this.hasher.isIgnored(remotePath)) {
+          continue;
+        }
+        if (localPathSet.has(remotePath)) {
+          continue;
+        }
+        const isExplicitlyDeleted = pendingDeletions.has(remotePath) || pendingDeletionList.some((p) => remotePath === p || remotePath.startsWith(p.endsWith("/") ? p : `${p}/`));
+        const isPreviouslyTracked = remotePath in settings.syncedFileHashes;
+        const remoteModMs = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
+        const existedAtLastSync = lastSyncMs > 0 && remoteModMs <= lastSyncMs + 1e4;
+        if (isExplicitlyDeleted || isPreviouslyTracked || existedAtLastSync) {
+          deletedToTrash.push({ path: remotePath, remoteFile });
+        }
+      }
+      const deletedFoldersToTrash = [];
+      for (const delPath of pendingDeletionList) {
+        const folderId = this.folderTree.getCachedFolderId(delPath);
+        if (folderId && !Array.from(localPathSet).some((lp) => lp.startsWith(delPath.endsWith("/") ? delPath : `${delPath}/`))) {
+          deletedFoldersToTrash.push({ path: delPath, folderId });
+        }
+      }
+      if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0) {
         new import_obsidian4.Notice("Google Drive Sync: Everything is up to date. Nothing to push.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
@@ -643,6 +994,33 @@ var ManualSyncEngine = class {
         await this.offlineTracker.clearPendingChanges();
         this.statusBar.setStatus("up-to-date");
         return;
+      }
+      let trashedCount = 0;
+      if (deletedToTrash.length > 0 || deletedFoldersToTrash.length > 0) {
+        const totalToDelete = deletedToTrash.length + deletedFoldersToTrash.length;
+        this.statusBar.setStatus("syncing", `Trashing ${totalToDelete} item(s)...`);
+        for (const item of deletedToTrash) {
+          try {
+            await this.client.trashFile(item.remoteFile.id);
+            delete settings.syncedFileHashes[item.path];
+            trashedCount++;
+          } catch (delErr) {
+            console.warn(`Could not trash remote file ${item.path}:`, delErr);
+          }
+        }
+        for (const fItem of deletedFoldersToTrash) {
+          try {
+            await this.client.trashFile(fItem.folderId);
+            trashedCount++;
+          } catch (delErr) {
+            console.warn(`Could not trash remote folder ${fItem.path}:`, delErr);
+          }
+        }
+        for (const trackedPath of Object.keys(settings.syncedFileHashes)) {
+          if (!localPathSet.has(trackedPath) && !remoteMap.has(trackedPath)) {
+            delete settings.syncedFileHashes[trackedPath];
+          }
+        }
       }
       const uniqueFolders = Array.from(
         new Set(
@@ -665,16 +1043,20 @@ var ManualSyncEngine = class {
         await Promise.all(
           batch.map(async (item) => {
             const cleanPath = item.local.relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
-            const abstractFile = this.app.vault.getAbstractFileByPath(item.local.relativePath);
-            if (abstractFile instanceof import_obsidian4.TFile) {
-              const binaryData = await this.app.vault.readBinary(abstractFile);
+            const binaryData = await this.readLocalFileBinary(cleanPath);
+            if (binaryData) {
               const mimeType = this.getMimeType(cleanPath);
+              const onProgress = item.local.size > 5 * 1024 * 1024 ? (uploadedBytes, totalBytes) => {
+                const pct = Math.round(uploadedBytes / totalBytes * 100);
+                const filename = cleanPath.split("/").pop();
+                this.statusBar.setStatus("syncing", `${filename} (${pct}%)`);
+              } : void 0;
               if (item.remote) {
-                await this.client.updateFileContent(item.remote.id, mimeType, binaryData);
+                await this.client.updateFileContent(item.remote.id, mimeType, binaryData, onProgress);
               } else {
                 const parentFolderId = await this.folderTree.ensureFolderPath(cleanPath);
                 const filename = cleanPath.split("/").pop();
-                await this.client.uploadNewFile(filename, parentFolderId, mimeType, binaryData);
+                await this.client.uploadNewFile(filename, parentFolderId, mimeType, binaryData, onProgress);
               }
               settings.syncedFileHashes[cleanPath] = item.local.hash;
               uploadedCount++;
@@ -688,8 +1070,22 @@ var ManualSyncEngine = class {
       await this.saveSettings();
       await this.offlineTracker.clearPendingChanges();
       this.statusBar.setStatus("up-to-date");
-      new import_obsidian4.Notice(`Google Drive Sync: Successfully pushed ${uploadedCount} file(s) to Drive!`);
+      let noticeMsg = `Google Drive Sync: Successfully pushed ${uploadedCount} file(s) to Drive!`;
+      if (uploadedCount > 0 && trashedCount > 0) {
+        noticeMsg = `Google Drive Sync: Uploaded ${uploadedCount} file(s), moved ${trashedCount} deleted file(s) to Drive trash!`;
+      } else if (trashedCount > 0) {
+        noticeMsg = `Google Drive Sync: Moved ${trashedCount} deleted file(s) to Drive trash!`;
+      }
+      new import_obsidian4.Notice(noticeMsg);
     } catch (err) {
+      const isOffline = ((_a = err.message) == null ? void 0 : _a.includes("NETWORK_OFFLINE")) || ((_b = err.message) == null ? void 0 : _b.includes("UnknownHostException")) || ((_c = err.message) == null ? void 0 : _c.includes("ENOTFOUND")) || ((_d = err.message) == null ? void 0 : _d.includes("Failed to fetch"));
+      if (isOffline) {
+        settings.lastSyncStatus = "offline";
+        await this.saveSettings();
+        this.statusBar.setStatus("offline");
+        new import_obsidian4.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
+        return;
+      }
       console.error("Push Error:", err);
       settings.lastSyncStatus = "failed";
       await this.saveSettings();
@@ -701,6 +1097,7 @@ var ManualSyncEngine = class {
    * PULL: Downloads cloud vault changes directly from Google Drive.
    */
   async pull() {
+    var _a, _b, _c, _d;
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
@@ -726,18 +1123,58 @@ var ManualSyncEngine = class {
       for (const lf of localFiles) {
         localMap.set(lf.relativePath.replace(/\\/g, "/").replace(/^\/+/, ""), lf);
       }
+      const remotePathSet = new Set(remoteMap.keys());
+      let localTrashedCount = 0;
+      const configDir = this.app.vault.configDir || ".obsidian";
+      for (const trackedPath of Object.keys(settings.syncedFileHashes)) {
+        if (!remotePathSet.has(trackedPath) && localMap.has(trackedPath)) {
+          if (!settings.pendingDeletedPaths || !settings.pendingDeletedPaths.includes(trackedPath)) {
+            try {
+              if (isConfigDirFile(trackedPath, configDir)) {
+                if (await this.app.vault.adapter.exists(trackedPath)) {
+                  await this.app.vault.adapter.remove(trackedPath);
+                  delete settings.syncedFileHashes[trackedPath];
+                  localTrashedCount++;
+                }
+              } else {
+                const abstractFile = this.app.vault.getAbstractFileByPath(trackedPath);
+                if (abstractFile instanceof import_obsidian4.TFile) {
+                  await this.app.vault.trash(abstractFile, true);
+                  delete settings.syncedFileHashes[trackedPath];
+                  localTrashedCount++;
+                }
+              }
+            } catch (trashErr) {
+              console.warn(`Could not trash local file ${trackedPath}:`, trashErr);
+            }
+          }
+        }
+      }
       const toDownload = [];
       for (const [remotePath, remoteFile] of remoteMap.entries()) {
+        if (this.hasher.isIgnored(remotePath)) {
+          continue;
+        }
         const local = localMap.get(remotePath);
         const remoteSize = remoteFile.size !== void 0 ? parseInt(remoteFile.size, 10) : 0;
         const cachedHash = settings.syncedFileHashes[remotePath];
         if (!local) {
+          const isPendingDeleted = settings.pendingDeletedPaths && settings.pendingDeletedPaths.some((p) => remotePath === p || remotePath.startsWith(p.endsWith("/") ? p : `${p}/`));
+          if (isPendingDeleted) {
+            continue;
+          }
           toDownload.push(remoteFile);
-        } else if (remoteSize !== local.size) {
-          toDownload.push(remoteFile);
+        } else {
+          const isSizeDifferent = remoteSize !== local.size;
+          const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
+          const isRemoteNewer = remoteTime > local.mtime + 2e3;
+          const isContentMismatch = cachedHash ? cachedHash !== local.hash : true;
+          if (isSizeDifferent || isRemoteNewer && isContentMismatch) {
+            toDownload.push(remoteFile);
+          }
         }
       }
-      if (toDownload.length === 0) {
+      if (toDownload.length === 0 && localTrashedCount === 0) {
         new import_obsidian4.Notice("Google Drive Sync: Your vault is already up to date with Google Drive.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
@@ -746,16 +1183,14 @@ var ManualSyncEngine = class {
         return;
       }
       let downloadedCount = 0;
+      let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
       for (const remoteFile of toDownload) {
         const relPath = this.getRelativePathForRemote(remoteFile, remoteMap);
         const data = await this.client.downloadFileContent(remoteFile.id);
-        await this.ensureLocalParentDir(relPath);
-        const existing = this.app.vault.getAbstractFileByPath(relPath);
-        if (existing instanceof import_obsidian4.TFile) {
-          await this.app.vault.modifyBinary(existing, data);
-        } else {
-          await this.app.vault.createBinary(relPath, data);
+        await this.writeLocalFileBinary(relPath, data);
+        if (isPluginOrThemeFile(relPath, configDir)) {
+          hasUpdatedPluginsOrThemes = true;
         }
         const newHash = await this.hasher.computeHash(data);
         settings.syncedFileHashes[relPath] = newHash;
@@ -766,13 +1201,77 @@ var ManualSyncEngine = class {
       settings.lastSyncStatus = "up-to-date";
       await this.saveSettings();
       this.statusBar.setStatus("up-to-date");
-      new import_obsidian4.Notice(`Google Drive Sync: Successfully downloaded ${downloadedCount} note(s)!`);
+      let pullMsg = `Google Drive Sync: Successfully downloaded ${downloadedCount} note(s)!`;
+      if (downloadedCount > 0 && localTrashedCount > 0) {
+        pullMsg = `Google Drive Sync: Downloaded ${downloadedCount} note(s), removed ${localTrashedCount} remote-deleted item(s).`;
+      } else if (localTrashedCount > 0) {
+        pullMsg = `Google Drive Sync: Removed ${localTrashedCount} remote-deleted item(s).`;
+      }
+      new import_obsidian4.Notice(pullMsg);
+      if (hasUpdatedPluginsOrThemes) {
+        new import_obsidian4.Notice("Google Drive Sync: Plugins or themes were updated. Reload Obsidian (Ctrl/Cmd + R) to activate them.", 8e3);
+      }
     } catch (err) {
+      const isOffline = ((_a = err.message) == null ? void 0 : _a.includes("NETWORK_OFFLINE")) || ((_b = err.message) == null ? void 0 : _b.includes("UnknownHostException")) || ((_c = err.message) == null ? void 0 : _c.includes("ENOTFOUND")) || ((_d = err.message) == null ? void 0 : _d.includes("Failed to fetch"));
+      if (isOffline) {
+        settings.lastSyncStatus = "offline";
+        await this.saveSettings();
+        this.statusBar.setStatus("offline");
+        new import_obsidian4.Notice("Google Drive Sync: No internet connection. Please check your network and try again.");
+        return;
+      }
       console.error("Pull Error:", err);
       settings.lastSyncStatus = "failed";
       await this.saveSettings();
       this.statusBar.setStatus("failed");
       new import_obsidian4.Notice(`Google Drive Pull failed: ${err.message}`);
+    }
+  }
+  /**
+   * Safely reads binary content from either regular vault files or hidden .obsidian config files.
+   */
+  async readLocalFileBinary(cleanPath) {
+    try {
+      const configDir = this.app.vault.configDir || ".obsidian";
+      if (isConfigDirFile(cleanPath, configDir)) {
+        const buffer = await this.app.vault.adapter.readBinary(cleanPath);
+        return new Uint8Array(buffer);
+      }
+      const abstractFile = this.app.vault.getAbstractFileByPath(cleanPath);
+      if (abstractFile instanceof import_obsidian4.TFile) {
+        const buffer = await this.app.vault.readBinary(abstractFile);
+        return new Uint8Array(buffer);
+      }
+      if (await this.app.vault.adapter.exists(cleanPath)) {
+        const buffer = await this.app.vault.adapter.readBinary(cleanPath);
+        return new Uint8Array(buffer);
+      }
+      return null;
+    } catch (e) {
+      console.warn(`Failed to read local binary file ${cleanPath}:`, e);
+      return null;
+    }
+  }
+  /**
+   * Safely writes binary content to either regular vault files or hidden .obsidian config files.
+   */
+  async writeLocalFileBinary(relativePath, data) {
+    await this.ensureLocalParentDir(relativePath);
+    const configDir = this.app.vault.configDir || ".obsidian";
+    const arrayBuffer = data instanceof Uint8Array ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data;
+    if (isConfigDirFile(relativePath, configDir)) {
+      await this.app.vault.adapter.writeBinary(relativePath, arrayBuffer);
+      return;
+    }
+    const existing = this.app.vault.getAbstractFileByPath(relativePath);
+    if (existing instanceof import_obsidian4.TFile) {
+      await this.app.vault.modifyBinary(existing, arrayBuffer);
+    } else {
+      try {
+        await this.app.vault.createBinary(relativePath, arrayBuffer);
+      } catch (e) {
+        await this.app.vault.adapter.writeBinary(relativePath, arrayBuffer);
+      }
     }
   }
   getRelativePathForRemote(targetFile, remoteMap) {
@@ -785,14 +1284,24 @@ var ManualSyncEngine = class {
     const parts = relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
     parts.pop();
     if (parts.length === 0) return;
+    const configDir = this.app.vault.configDir || ".obsidian";
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
-      const exists = this.app.vault.getAbstractFileByPath(current);
+      const isConfig = isConfigDirFile(current, configDir);
+      const exists = isConfig ? await this.app.vault.adapter.exists(current) : this.app.vault.getAbstractFileByPath(current) !== null;
       if (!exists) {
         try {
-          await this.app.vault.createFolder(current);
+          if (isConfig) {
+            await this.app.vault.adapter.mkdir(current);
+          } else {
+            await this.app.vault.createFolder(current);
+          }
         } catch (e) {
+          try {
+            await this.app.vault.adapter.mkdir(current);
+          } catch (e2) {
+          }
         }
       }
     }
@@ -803,6 +1312,8 @@ var ManualSyncEngine = class {
     if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
     if (path.endsWith(".pdf")) return "application/pdf";
     if (path.endsWith(".json") || path.endsWith(".canvas")) return "application/json";
+    if (path.endsWith(".css")) return "text/css";
+    if (path.endsWith(".js")) return "application/javascript";
     return "application/octet-stream";
   }
 };
@@ -855,93 +1366,134 @@ var import_obsidian5 = require("obsidian");
 var GoogleDriveSettingTab = class extends import_obsidian5.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
-    this.pairingCodeInput = "";
     this.plugin = plugin;
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Google Drive Sync Settings" });
+    containerEl.createEl("h2", { text: "VaultGlide \u2014 Google Drive Sync" });
     containerEl.createEl("p", {
-      text: "Direct manual cloud synchronization for your vault using your personal Google Drive account. Zero third-party database storage.",
+      text: "Private, direct manual cloud synchronization using your personal Google Drive account. Zero third-party storage.",
       cls: "setting-item-description"
     });
-    new import_obsidian5.Setting(containerEl).setName("Google Drive Status").setDesc(
-      this.plugin.settings.accessToken ? `Connected as ${this.plugin.settings.userEmail || "Google User"} (Vault: My Drive/ObsidianSync/${this.plugin.settings.vaultName})` : "Not connected to Google Drive"
-    ).addButton((btn) => {
-      if (this.plugin.settings.accessToken) {
-        btn.setButtonText("Disconnect").setWarning().onClick(async () => {
-          this.plugin.settings.accessToken = "";
-          this.plugin.settings.refreshToken = "";
-          this.plugin.settings.userEmail = "";
-          this.plugin.settings.vaultFolderId = "";
-          this.plugin.settings.lastSyncStatus = "unauthenticated";
-          await this.plugin.saveSettings();
-          new import_obsidian5.Notice("Disconnected Google Drive");
-          this.display();
-        });
-      } else {
-        btn.setButtonText("Open Web Setup Wizard").setCta().onClick(() => {
-          window.open(this.plugin.settings.serverRelayUrl || "http://localhost:5173", "_blank");
-        });
-      }
-    });
-    containerEl.createEl("h3", { text: "Device Pairing (Mobile \u2194 Desktop)" });
-    new import_obsidian5.Setting(containerEl).setName("Enter 6-Digit Pair Code").setDesc("Enter a code generated from your other device or web setup portal.").addText(
-      (text) => text.setPlaceholder("e.g. SYNC-849").setValue(this.pairingCodeInput).onChange((val) => this.pairingCodeInput = val)
-    ).addButton(
-      (btn) => btn.setButtonText("Link Device").setCta().onClick(async () => {
-        if (!this.pairingCodeInput.trim()) {
-          new import_obsidian5.Notice("Please enter a 6-digit pairing code");
-          return;
-        }
-        try {
-          btn.setDisabled(true);
-          await this.plugin.auth.redeemPairingCode(this.pairingCodeInput);
-          new import_obsidian5.Notice("Device paired successfully with Google Drive!");
-          this.display();
-        } catch (err) {
-          new import_obsidian5.Notice(`Pairing failed: ${err.message}`);
-        } finally {
-          btn.setDisabled(false);
-        }
+    const isConnected = Boolean(this.plugin.settings.accessToken);
+    const isSessionExpired = this.plugin.settings.lastSyncStatus === "unauthenticated";
+    if (!isConnected) {
+      const connectSetting = new import_obsidian5.Setting(containerEl).setName("Connection Status: Not Connected").setDesc("Connect your personal Google Drive via the VaultGlide web portal to sync your notes across devices.").addButton(
+        (btn) => btn.setButtonText("Connect with VaultGlide").setCta().onClick(() => {
+          const targetUrl = this.plugin.settings.serverRelayUrl || "http://localhost:5180";
+          window.open(targetUrl, "_blank");
+          new import_obsidian5.Notice("Opening VaultGlide Web Portal in your browser...");
+        })
+      );
+      connectSetting.settingEl.style.border = "1px solid var(--background-modifier-border)";
+      connectSetting.settingEl.style.borderRadius = "8px";
+      connectSetting.settingEl.style.padding = "12px";
+      connectSetting.settingEl.style.marginBottom = "16px";
+    } else if (isSessionExpired) {
+      const expiredSetting = new import_obsidian5.Setting(containerEl).setName("\u26A0\uFE0F Session Expired / Re-authentication Needed").setDesc(`Your Google Drive token for ${this.plugin.settings.userEmail || "account"} needs to be renewed.`).addButton(
+        (btn) => btn.setButtonText("Re-authenticate on Web").setWarning().onClick(() => {
+          const targetUrl = this.plugin.settings.serverRelayUrl || "http://localhost:5180";
+          window.open(targetUrl, "_blank");
+          new import_obsidian5.Notice("Opening VaultGlide to renew connection...");
+        })
+      ).addButton(
+        (btn) => btn.setButtonText("Disconnect").onClick(async () => {
+          await this.handleDisconnect();
+        })
+      );
+      expiredSetting.settingEl.style.border = "1px solid var(--text-warning)";
+      expiredSetting.settingEl.style.borderRadius = "8px";
+      expiredSetting.settingEl.style.padding = "12px";
+      expiredSetting.settingEl.style.marginBottom = "16px";
+    } else {
+      const connectedSetting = new import_obsidian5.Setting(containerEl).setName(`\u{1F7E2} Connected: ${this.plugin.settings.userEmail || "Google User"}`).setDesc(`Cloud Vault: Google Drive/VaultGlide/${this.plugin.settings.vaultName}`).addButton(
+        (btn) => btn.setButtonText("Push Notes").setCta().onClick(async () => {
+          await this.plugin.syncEngine.push();
+        })
+      ).addButton(
+        (btn) => btn.setButtonText("Pull Notes").onClick(async () => {
+          await this.plugin.syncEngine.pull();
+        })
+      ).addButton(
+        (btn) => btn.setButtonText("Disconnect").setWarning().onClick(async () => {
+          await this.handleDisconnect();
+        })
+      );
+      connectedSetting.settingEl.style.border = "1px solid var(--interactive-accent)";
+      connectedSetting.settingEl.style.borderRadius = "8px";
+      connectedSetting.settingEl.style.padding = "12px";
+      connectedSetting.settingEl.style.marginBottom = "16px";
+    }
+    containerEl.createEl("h3", { text: "Vault & Storage Settings" });
+    new import_obsidian5.Setting(containerEl).setName("Cloud Vault Folder Name").setDesc("Folder created inside your personal Google Drive (My Drive/VaultGlide/<VaultName>)").addText(
+      (text) => text.setPlaceholder("MyVault").setValue(this.plugin.settings.vaultName).onChange(async (value) => {
+        this.plugin.settings.vaultName = value.trim() || "MyVault";
+        await this.plugin.saveSettings();
       })
     );
-    if (this.plugin.settings.accessToken) {
-      new import_obsidian5.Setting(containerEl).setName("Generate Pairing Code for Another Device").setDesc("Creates a temporary 10-minute 6-digit code you can enter on your other device.").addButton(
-        (btn) => btn.setButtonText("Generate Code").onClick(async () => {
-          try {
-            btn.setDisabled(true);
-            const result = await this.plugin.auth.createPairingCode();
-            new import_obsidian5.Notice(`Pairing Code: ${result.code} (Expires in 10 mins)`, 1e4);
-          } catch (err) {
-            new import_obsidian5.Notice(`Failed to generate code: ${err.message}`);
-          } finally {
-            btn.setDisabled(false);
-          }
+    new import_obsidian5.Setting(containerEl).setName("VaultGlide Web Portal URL").setDesc("The web companion dashboard URL for web viewing and initial authentication.").addText(
+      (text) => text.setPlaceholder("http://localhost:5180").setValue(this.plugin.settings.serverRelayUrl).onChange(async (value) => {
+        this.plugin.settings.serverRelayUrl = value.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    containerEl.createEl("h3", { text: "Configuration & Plugin Sync (.obsidian)" });
+    containerEl.createEl("p", {
+      text: "Synchronize Obsidian preferences, themes, and community plugins across your devices via Google Drive.",
+      cls: "setting-item-description"
+    });
+    new import_obsidian5.Setting(containerEl).setName("Sync Configuration & Plugins (.obsidian)").setDesc("Master toggle: Scan and synchronize files inside the .obsidian folder.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.syncConfigDir).onChange(async (val) => {
+        this.plugin.settings.syncConfigDir = val;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    if (this.plugin.settings.syncConfigDir) {
+      new import_obsidian5.Setting(containerEl).setName("Sync Core Settings & Hotkeys").setDesc("Sync general app preferences, file options, and hotkeys (app.json, hotkeys.json).").addToggle(
+        (toggle) => toggle.setValue(this.plugin.settings.syncCoreSettings).onChange(async (val) => {
+          this.plugin.settings.syncCoreSettings = val;
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian5.Setting(containerEl).setName("Sync Themes & CSS Snippets").setDesc("Sync active theme, custom styles, and snippets (appearance.json, snippets/).").addToggle(
+        (toggle) => toggle.setValue(this.plugin.settings.syncAppearance).onChange(async (val) => {
+          this.plugin.settings.syncAppearance = val;
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian5.Setting(containerEl).setName("Sync Community Plugins").setDesc("Sync installed community plugins and settings. (VaultGlide credentials are automatically excluded for safety).").addToggle(
+        (toggle) => toggle.setValue(this.plugin.settings.syncCommunityPlugins).onChange(async (val) => {
+          this.plugin.settings.syncCommunityPlugins = val;
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian5.Setting(containerEl).setName("Sync Workspace Layout (Open Tabs)").setDesc("Sync open tabs and panes (workspace.json). Recommended: OFF if syncing between Desktop and Mobile.").addToggle(
+        (toggle) => toggle.setValue(this.plugin.settings.syncWorkspaceLayout).onChange(async (val) => {
+          this.plugin.settings.syncWorkspaceLayout = val;
+          await this.plugin.saveSettings();
         })
       );
     }
-    containerEl.createEl("h3", { text: "Vault Configuration" });
-    new import_obsidian5.Setting(containerEl).setName("Vault Name").setDesc("The subfolder name in Google Drive (My Drive/ObsidianSync/<VaultName>)").addText(
-      (text) => text.setPlaceholder("MyVault").setValue(this.plugin.settings.vaultName).onChange(async (value) => {
-        this.plugin.settings.vaultName = value;
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian5.Setting(containerEl).setName("Pairing Relay / Server URL").setDesc("Lightweight relay server URL for 1-time OAuth callback & pairing handshake.").addText(
-      (text) => text.setPlaceholder("http://localhost:5050").setValue(this.plugin.settings.serverRelayUrl).onChange(async (value) => {
-        this.plugin.settings.serverRelayUrl = value;
-        await this.plugin.saveSettings();
-      })
-    );
     containerEl.createEl("h3", { text: "Sync Ignore Rules" });
-    new import_obsidian5.Setting(containerEl).setName("Custom Ignored Regex Patterns").setDesc("Enter one regex pattern per line (e.g. ^Private/ or \\.secret$)").addTextArea(
+    new import_obsidian5.Setting(containerEl).setName("Custom Ignored Regex Patterns").setDesc("Enter one regex pattern per line to exclude files/folders from sync (e.g. ^Private/ or \\.secret$)").addTextArea(
       (text) => text.setPlaceholder("^Private/\n\\.secret$").setValue(this.plugin.settings.customIgnoredPatterns.join("\n")).onChange(async (value) => {
         this.plugin.settings.customIgnoredPatterns = value.split("\n").map((s) => s.trim()).filter(Boolean);
         await this.plugin.saveSettings();
       })
     );
+  }
+  async handleDisconnect() {
+    this.plugin.settings.accessToken = "";
+    this.plugin.settings.refreshToken = "";
+    this.plugin.settings.userEmail = "";
+    this.plugin.settings.vaultFolderId = "";
+    this.plugin.settings.lastSyncStatus = "unauthenticated";
+    await this.plugin.saveSettings();
+    this.plugin.statusBar.setStatus("unauthenticated");
+    new import_obsidian5.Notice("Disconnected from Google Drive");
+    this.display();
   }
 };
 
@@ -997,6 +1549,44 @@ var GoogleDriveSyncPlugin = class extends import_obsidian6.Plugin {
         if (!navigator.onLine) {
           this.offlineTracker.trackFileModification(file.path);
         } else if (this.settings.lastSyncStatus === "up-to-date") {
+          this.settings.lastSyncStatus = "local-changes";
+          this.statusBar.setStatus("local-changes");
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        const cleanPath = file.path.replace(/\\/g, "/").replace(/^\/+/, "");
+        this.offlineTracker.trackFileDeletion(cleanPath);
+        if (this.settings.syncedFileHashes) {
+          const folderPrefix = cleanPath.endsWith("/") ? cleanPath : `${cleanPath}/`;
+          for (const trackedPath of Object.keys(this.settings.syncedFileHashes)) {
+            if (trackedPath.startsWith(folderPrefix)) {
+              this.offlineTracker.trackFileDeletion(trackedPath);
+            }
+          }
+        }
+        if (this.settings.lastSyncStatus === "up-to-date") {
+          this.settings.lastSyncStatus = "local-changes";
+          this.statusBar.setStatus("local-changes");
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        const cleanOld = oldPath.replace(/\\/g, "/").replace(/^\/+/, "");
+        const cleanNew = file.path.replace(/\\/g, "/").replace(/^\/+/, "");
+        this.offlineTracker.trackFileDeletion(cleanOld);
+        this.offlineTracker.trackFileModification(cleanNew);
+        if (this.settings.syncedFileHashes) {
+          const folderOldPrefix = cleanOld.endsWith("/") ? cleanOld : `${cleanOld}/`;
+          for (const trackedPath of Object.keys(this.settings.syncedFileHashes)) {
+            if (trackedPath.startsWith(folderOldPrefix)) {
+              this.offlineTracker.trackFileDeletion(trackedPath);
+            }
+          }
+        }
+        if (this.settings.lastSyncStatus === "up-to-date") {
           this.settings.lastSyncStatus = "local-changes";
           this.statusBar.setStatus("local-changes");
         }
