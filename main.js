@@ -1305,7 +1305,12 @@ var ManualSyncEngine = class {
           deletedFoldersToTrash.push({ path: delPath, folderId });
         }
       }
-      if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0) {
+      const allLocalFolders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian5.TFolder && f.path !== "/" && f.path !== "");
+      const localFolderPaths = allLocalFolders.map((f) => f.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")).filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
+      const missingRemoteFolders = localFolderPaths.filter(
+        (folderPath) => !this.folderTree.getCachedFolderId(folderPath)
+      );
+      if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0 && missingRemoteFolders.length === 0) {
         new import_obsidian5.Notice("Google Drive Sync: Everything is up to date. Nothing to push.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
@@ -1346,12 +1351,17 @@ var ManualSyncEngine = class {
         parts.pop();
         return parts.join("/");
       }).filter(Boolean);
-      const allLocalFolders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian5.TFolder && f.path !== "/" && f.path !== "");
-      const localFolderPaths = allLocalFolders.map((f) => f.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")).filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
       const allFolderPathsToEnsure = Array.from(/* @__PURE__ */ new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
+      let createdFoldersCount = 0;
       if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus("syncing", "Preparing folders...");
-        await Promise.all(allFolderPathsToEnsure.map((p) => this.folderTree.ensureDirectoryPath(p)));
+        await Promise.all(
+          allFolderPathsToEnsure.map(async (p) => {
+            const isNew = !this.folderTree.getCachedFolderId(p);
+            await this.folderTree.ensureDirectoryPath(p);
+            if (isNew) createdFoldersCount++;
+          })
+        );
       }
       let uploadedCount2 = 0;
       const total = toUpload.length;
@@ -1422,7 +1432,9 @@ var ManualSyncEngine = class {
         status: "success"
       });
       let noticeMsg = `Google Drive Sync: Successfully pushed ${uploadedCount2} file(s) to Drive!`;
-      if (uploadedCount2 > 0 && trashedCount > 0) {
+      if (uploadedCount2 === 0 && createdFoldersCount > 0) {
+        noticeMsg = `Google Drive Sync: Successfully pushed ${createdFoldersCount} folder(s) to Drive!`;
+      } else if (uploadedCount2 > 0 && trashedCount > 0) {
         noticeMsg = `Google Drive Sync: Uploaded ${uploadedCount2} file(s), moved ${trashedCount} deleted file(s) to Drive trash!`;
       } else if (trashedCount > 0) {
         noticeMsg = `Google Drive Sync: Moved ${trashedCount} deleted file(s) to Drive trash!`;

@@ -179,7 +179,18 @@ export class ManualSyncEngine {
         }
       }
 
-      if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0) {
+      // 5. Detect local folders that don't exist on Google Drive (including empty folders)
+      const allLocalFolders = this.app.vault.getAllLoadedFiles()
+        .filter((f): f is TFolder => f instanceof TFolder && f.path !== '/' && f.path !== '');
+      const localFolderPaths = allLocalFolders
+        .map((f) => f.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+        .filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
+
+      const missingRemoteFolders = localFolderPaths.filter(
+        (folderPath) => !this.folderTree.getCachedFolderId(folderPath)
+      );
+
+      if (toUpload.length === 0 && deletedToTrash.length === 0 && deletedFoldersToTrash.length === 0 && missingRemoteFolders.length === 0) {
         new Notice('Google Drive Sync: Everything is up to date. Nothing to push.');
         settings.lastSyncTime = new Date().toISOString();
         settings.lastSyncStatus = 'up-to-date';
@@ -189,7 +200,7 @@ export class ManualSyncEngine {
         return;
       }
 
-      // 5. Execute Google Drive Trash for deleted files and folders
+      // 6. Execute Google Drive Trash for deleted files and folders
       let trashedCount = 0;
       if (deletedToTrash.length > 0 || deletedFoldersToTrash.length > 0) {
         const totalToDelete = deletedToTrash.length + deletedFoldersToTrash.length;
@@ -222,24 +233,25 @@ export class ManualSyncEngine {
         }
       }
 
-      // 6. Pre-pass: Warm up all unique folder IDs in parallel (including empty folders)
+      // 7. Warm up all unique folder IDs in parallel (including empty folders)
       const uniqueFoldersFromUpload = toUpload.map((item) => {
         const parts = item.local.relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
         parts.pop();
         return parts.join('/');
       }).filter(Boolean);
 
-      const allLocalFolders = this.app.vault.getAllLoadedFiles()
-        .filter((f): f is TFolder => f instanceof TFolder && f.path !== '/' && f.path !== '');
-      const localFolderPaths = allLocalFolders
-        .map((f) => f.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
-        .filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
-
       const allFolderPathsToEnsure = Array.from(new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
 
+      let createdFoldersCount = 0;
       if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus('syncing', 'Preparing folders...');
-        await Promise.all(allFolderPathsToEnsure.map((p) => this.folderTree.ensureDirectoryPath(p)));
+        await Promise.all(
+          allFolderPathsToEnsure.map(async (p) => {
+            const isNew = !this.folderTree.getCachedFolderId(p);
+            await this.folderTree.ensureDirectoryPath(p);
+            if (isNew) createdFoldersCount++;
+          })
+        );
       }
 
       // 7. High-Speed Upload via Continuous Stream & Live Screen Notice
@@ -329,7 +341,9 @@ export class ManualSyncEngine {
       });
 
       let noticeMsg = `Google Drive Sync: Successfully pushed ${uploadedCount} file(s) to Drive!`;
-      if (uploadedCount > 0 && trashedCount > 0) {
+      if (uploadedCount === 0 && createdFoldersCount > 0) {
+        noticeMsg = `Google Drive Sync: Successfully pushed ${createdFoldersCount} folder(s) to Drive!`;
+      } else if (uploadedCount > 0 && trashedCount > 0) {
         noticeMsg = `Google Drive Sync: Uploaded ${uploadedCount} file(s), moved ${trashedCount} deleted file(s) to Drive trash!`;
       } else if (trashedCount > 0) {
         noticeMsg = `Google Drive Sync: Moved ${trashedCount} deleted file(s) to Drive trash!`;
