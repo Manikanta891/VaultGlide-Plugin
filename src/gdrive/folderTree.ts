@@ -136,4 +136,21 @@ export class FolderTreeManager {
     await traverse(effectiveRootId, '');
     return fileMap;
   }
+
+  /**
+   * Directly ensures a directory exists on Google Drive, creating intermediate folders as needed.
+   * Unlike ensureFolderPath, does not pop the final segment.
+   */
+  public async ensureDirectoryPath(dirRelativePath: string): Promise<string> {
+    const clean = dirRelativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!clean) return await this.getOrEnsureRootId();
+    return this.ensureFolderPath(`${clean}/placeholder.tmp`);
+  }
+
+  /**
+   * Returns a map of all relative folder paths discovered in the remote vault.
+   */
+  public getAllDiscoveredRemoteFolders(): Map<string, string> {
+    return new Map(this.folderIdCache);
+  }
 }

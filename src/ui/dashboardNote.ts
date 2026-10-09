@@ -43,15 +43,17 @@ export class DashboardNoteManager {
   }
 
   /**
-   * Scans local vault for statistics on markdown notes.
+   * Scans local vault for statistics across all files and folders.
    */
-  public getVaultStats(): { totalNotes: number; totalSize: number; totalFolders: number } {
-    const files = this.app.vault.getFiles().filter((f) => f.extension === 'md' && f.name !== DashboardNoteManager.DASHBOARD_FILE);
-    const totalNotes = files.length;
-    const totalSize = files.reduce((acc, f) => acc + (f.stat?.size || 0), 0);
+  public getVaultStats(): { totalFiles: number; totalNotes: number; totalAssets: number; totalSize: number; totalFolders: number } {
+    const allFiles = this.app.vault.getFiles().filter((f) => f.name !== DashboardNoteManager.DASHBOARD_FILE);
+    const totalFiles = allFiles.length;
+    const totalNotes = allFiles.filter((f) => f.extension === 'md').length;
+    const totalAssets = Math.max(0, totalFiles - totalNotes);
+    const totalSize = allFiles.reduce((acc, f) => acc + (f.stat?.size || 0), 0);
     const totalFolders = this.app.vault.getAllLoadedFiles().filter((f) => 'children' in f).length;
 
-    return { totalNotes, totalSize, totalFolders };
+    return { totalFiles, totalNotes, totalAssets, totalSize, totalFolders };
   }
 
   /**
@@ -102,7 +104,10 @@ export class DashboardNoteManager {
     lines.push('## 📊 Vault Statistics\n');
     lines.push('| Metric | Value |');
     lines.push('| :--- | :--- |');
-    lines.push(`| **Total Markdown Notes** | \`${stats.totalNotes} notes\` |`);
+    lines.push(`| **Total Vault Files** | \`${stats.totalFiles} files\` |`);
+    lines.push(`| **Markdown Notes** | \`${stats.totalNotes} notes\` |`);
+    lines.push(`| **Canvases & Attachments** | \`${stats.totalAssets} files\` |`);
+    lines.push(`| **Total Folders** | \`${stats.totalFolders} folders\` |`);
     lines.push(`| **Total Vault Size** | \`${this.formatBytes(stats.totalSize)}\` |`);
     lines.push(`| **Tracked Cloud Hashes** | \`${Object.keys(settings.syncedFileHashes || {}).length} files\` |`);
     lines.push(`| **Google Drive Folder ID** | \`${settings.vaultFolderId || 'Pending initial sync'}\` |\n`);
@@ -161,6 +166,8 @@ export class DashboardNoteManager {
     lines.push('## ⚡ Live Sync Progress\n');
     if (diff?.isSyncing) {
       lines.push(`> 🔄 **Actively Syncing:** ${diff.syncProgress || 'Processing...'}\n`);
+    } else if (settings.lastSyncTime) {
+      lines.push(`> ⏳ **Idle** — Ready for manual Push or Pull. *(Last sync completed: ${this.formatTimestamp(settings.lastSyncTime)})*\n`);
     } else {
       lines.push('> ⏳ **Idle** — Ready for manual Push or Pull.\n');
     }

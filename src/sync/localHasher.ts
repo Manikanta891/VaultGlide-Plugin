@@ -24,9 +24,24 @@ export class LocalHasher {
 
   /**
    * Computes SHA-256 hex string for binary buffer using Web Crypto API.
+   * If filePath is a text format (.md, .txt, .canvas, .json, etc.),
+   * normalizes CRLF (\r\n) to LF (\n) before hashing so Windows, Android,
+   * and iOS generate identical SHA-256 digests.
    */
-  public async computeHash(buffer: ArrayBuffer): Promise<string> {
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  public async computeHash(buffer: ArrayBuffer, filePath?: string): Promise<string> {
+    let targetBuffer = buffer;
+    if (filePath && /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(filePath)) {
+      try {
+        const text = new TextDecoder('utf-8').decode(buffer);
+        if (text.includes('\r\n')) {
+          const normalized = text.replace(/\r\n/g, '\n');
+          targetBuffer = new TextEncoder().encode(normalized).buffer as ArrayBuffer;
+        }
+      } catch {
+        targetBuffer = buffer;
+      }
+    }
+    const hashBuffer = await crypto.subtle.digest('SHA-256', targetBuffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
   }
@@ -122,7 +137,7 @@ export class LocalHasher {
             }
 
             const data = await this.vault.readBinary(file);
-            const hash = await this.computeHash(data);
+            const hash = await this.computeHash(data, cleanPath);
             this.metaCache.set(cleanPath, { mtime: file.stat.mtime, size: file.stat.size, hash });
 
             return {
@@ -154,7 +169,7 @@ export class LocalHasher {
             try {
               const data = await this.vault.adapter.readBinary(path);
               const stat = await this.vault.adapter.stat(path);
-              const hash = await this.computeHash(data);
+              const hash = await this.computeHash(data, path);
               return {
                 relativePath: path,
                 hash,

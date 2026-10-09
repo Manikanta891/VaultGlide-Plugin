@@ -732,6 +732,21 @@ var FolderTreeManager = class {
     await traverse(effectiveRootId, "");
     return fileMap;
   }
+  /**
+   * Directly ensures a directory exists on Google Drive, creating intermediate folders as needed.
+   * Unlike ensureFolderPath, does not pop the final segment.
+   */
+  async ensureDirectoryPath(dirRelativePath) {
+    const clean = dirRelativePath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!clean) return await this.getOrEnsureRootId();
+    return this.ensureFolderPath(`${clean}/placeholder.tmp`);
+  }
+  /**
+   * Returns a map of all relative folder paths discovered in the remote vault.
+   */
+  getAllDiscoveredRemoteFolders() {
+    return new Map(this.folderIdCache);
+  }
 };
 
 // src/sync/configSyncFilter.ts
@@ -808,9 +823,24 @@ var LocalHasher = class {
   }
   /**
    * Computes SHA-256 hex string for binary buffer using Web Crypto API.
+   * If filePath is a text format (.md, .txt, .canvas, .json, etc.),
+   * normalizes CRLF (\r\n) to LF (\n) before hashing so Windows, Android,
+   * and iOS generate identical SHA-256 digests.
    */
-  async computeHash(buffer) {
-    const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  async computeHash(buffer, filePath) {
+    let targetBuffer = buffer;
+    if (filePath && /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(filePath)) {
+      try {
+        const text = new TextDecoder("utf-8").decode(buffer);
+        if (text.includes("\r\n")) {
+          const normalized = text.replace(/\r\n/g, "\n");
+          targetBuffer = new TextEncoder().encode(normalized).buffer;
+        }
+      } catch (e) {
+        targetBuffer = buffer;
+      }
+    }
+    const hashBuffer = await crypto.subtle.digest("SHA-256", targetBuffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
@@ -890,7 +920,7 @@ var LocalHasher = class {
               };
             }
             const data = await this.vault.readBinary(file);
-            const hash = await this.computeHash(data);
+            const hash = await this.computeHash(data, cleanPath);
             this.metaCache.set(cleanPath, { mtime: file.stat.mtime, size: file.stat.size, hash });
             return {
               relativePath: cleanPath,
@@ -917,7 +947,7 @@ var LocalHasher = class {
             try {
               const data = await this.vault.adapter.readBinary(path);
               const stat = await this.vault.adapter.stat(path);
-              const hash = await this.computeHash(data);
+              const hash = await this.computeHash(data, path);
               return {
                 relativePath: path,
                 hash,
@@ -969,17 +999,19 @@ var _DashboardNoteManager = class _DashboardNoteManager {
     }
   }
   /**
-   * Scans local vault for statistics on markdown notes.
+   * Scans local vault for statistics across all files and folders.
    */
   getVaultStats() {
-    const files = this.app.vault.getFiles().filter((f) => f.extension === "md" && f.name !== _DashboardNoteManager.DASHBOARD_FILE);
-    const totalNotes = files.length;
-    const totalSize = files.reduce((acc, f) => {
+    const allFiles = this.app.vault.getFiles().filter((f) => f.name !== _DashboardNoteManager.DASHBOARD_FILE);
+    const totalFiles = allFiles.length;
+    const totalNotes = allFiles.filter((f) => f.extension === "md").length;
+    const totalAssets = Math.max(0, totalFiles - totalNotes);
+    const totalSize = allFiles.reduce((acc, f) => {
       var _a;
       return acc + (((_a = f.stat) == null ? void 0 : _a.size) || 0);
     }, 0);
     const totalFolders = this.app.vault.getAllLoadedFiles().filter((f) => "children" in f).length;
-    return { totalNotes, totalSize, totalFolders };
+    return { totalFiles, totalNotes, totalAssets, totalSize, totalFolders };
   }
   /**
    * Generates formatted Markdown content for the VaultGlide Dashboard note.
@@ -1019,7 +1051,10 @@ var _DashboardNoteManager = class _DashboardNoteManager {
     lines.push("## \u{1F4CA} Vault Statistics\n");
     lines.push("| Metric | Value |");
     lines.push("| :--- | :--- |");
-    lines.push(`| **Total Markdown Notes** | \`${stats.totalNotes} notes\` |`);
+    lines.push(`| **Total Vault Files** | \`${stats.totalFiles} files\` |`);
+    lines.push(`| **Markdown Notes** | \`${stats.totalNotes} notes\` |`);
+    lines.push(`| **Canvases & Attachments** | \`${stats.totalAssets} files\` |`);
+    lines.push(`| **Total Folders** | \`${stats.totalFolders} folders\` |`);
     lines.push(`| **Total Vault Size** | \`${this.formatBytes(stats.totalSize)}\` |`);
     lines.push(`| **Tracked Cloud Hashes** | \`${Object.keys(settings.syncedFileHashes || {}).length} files\` |`);
     lines.push(`| **Google Drive Folder ID** | \`${settings.vaultFolderId || "Pending initial sync"}\` |
@@ -1073,6 +1108,9 @@ var _DashboardNoteManager = class _DashboardNoteManager {
     lines.push("## \u26A1 Live Sync Progress\n");
     if (diff == null ? void 0 : diff.isSyncing) {
       lines.push(`> \u{1F504} **Actively Syncing:** ${diff.syncProgress || "Processing..."}
+`);
+    } else if (settings.lastSyncTime) {
+      lines.push(`> \u23F3 **Idle** \u2014 Ready for manual Push or Pull. *(Last sync completed: ${this.formatTimestamp(settings.lastSyncTime)})*
 `);
     } else {
       lines.push("> \u23F3 **Idle** \u2014 Ready for manual Push or Pull.\n");
@@ -1145,6 +1183,11 @@ _DashboardNoteManager.DASHBOARD_FILE = "VaultGlide Dashboard.md";
 var DashboardNoteManager = _DashboardNoteManager;
 
 // src/sync/manualSyncEngine.ts
+function formatNoticeFilename(filename) {
+  const clean = filename.split("/").pop() || filename;
+  if (clean.length <= 22) return clean;
+  return `${clean.slice(0, 10)}...${clean.slice(-10)}`;
+}
 var ManualSyncEngine = class {
   constructor(app, getSettings, loadSettings, saveSettings, client, offlineTracker, statusBar) {
     this.app = app;
@@ -1214,12 +1257,16 @@ var ManualSyncEngine = class {
         } else {
           const remoteSize = remote.size !== void 0 ? parseInt(remote.size, 10) : 0;
           const cachedHash = settings.syncedFileHashes[cleanPath];
-          if (cachedHash && cachedHash === local.hash && remoteSize === local.size) {
+          if (cachedHash && cachedHash === local.hash) {
             continue;
           }
-          if (remoteSize === local.size && !cachedHash) {
+          const isSizeExact = remoteSize === local.size;
+          const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
+          const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
+          if ((isSizeExact || isSizeClose) && !cachedHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
-            if (local.mtime <= remoteTime + 1e3) {
+            const lastSyncMs2 = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+            if (local.mtime <= remoteTime + 3e3 || lastSyncMs2 > 0 && local.mtime <= lastSyncMs2 + 3e3) {
               settings.syncedFileHashes[cleanPath] = local.hash;
               continue;
             }
@@ -1294,30 +1341,42 @@ var ManualSyncEngine = class {
           }
         }
       }
-      const uniqueFolders = Array.from(
-        new Set(
-          toUpload.map((item) => {
-            const parts = item.local.relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
-            parts.pop();
-            return parts.join("/");
-          })
-        )
-      ).filter(Boolean);
-      if (uniqueFolders.length > 0) {
+      const uniqueFoldersFromUpload = toUpload.map((item) => {
+        const parts = item.local.relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
+        parts.pop();
+        return parts.join("/");
+      }).filter(Boolean);
+      const allLocalFolders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian5.TFolder && f.path !== "/" && f.path !== "");
+      const localFolderPaths = allLocalFolders.map((f) => f.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")).filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
+      const allFolderPathsToEnsure = Array.from(/* @__PURE__ */ new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
+      if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus("syncing", "Preparing folders...");
-        await Promise.all(uniqueFolders.map((p) => this.folderTree.ensureFolderPath(`${p}/placeholder.md`)));
+        await Promise.all(allFolderPathsToEnsure.map((p) => this.folderTree.ensureDirectoryPath(p)));
       }
       let uploadedCount2 = 0;
       const total = toUpload.length;
       const queue = [...toUpload];
       const WORKER_COUNT = import_obsidian5.Platform.isMobile ? 3 : 6;
       progressNotice = new import_obsidian5.Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
+      let lastDashboardUpdateMs = 0;
+      const maybeUpdateDashboard = async (progressText) => {
+        const now = Date.now();
+        if (now - lastDashboardUpdateMs > 1200 || uploadedCount2 === total) {
+          lastDashboardUpdateMs = now;
+          await this.dashboard.writeDashboardNote({
+            isSyncing: true,
+            syncProgress: progressText
+          });
+        }
+      };
       const updatePushStatus = (currentFilename) => {
         const pct = Math.round(uploadedCount2 / total * 100);
+        const displayName = formatNoticeFilename(currentFilename);
         this.statusBar.setStatus("syncing", `${uploadedCount2}/${total} (${pct}%)`);
         if (progressNotice) {
-          progressNotice.setMessage(`VaultGlide: [${uploadedCount2}/${total}] ${currentFilename} (${pct}%)`);
+          progressNotice.setMessage(`VaultGlide: [${uploadedCount2}/${total}] ${displayName} (${pct}%)`);
         }
+        maybeUpdateDashboard(`Uploading [${uploadedCount2}/${total}] ${displayName} (${pct}%)`);
       };
       const workers = Array(Math.min(WORKER_COUNT, queue.length)).fill(0).map(async () => {
         while (queue.length > 0) {
@@ -1392,6 +1451,8 @@ var ManualSyncEngine = class {
       new import_obsidian5.Notice(`Google Drive Push failed: ${err.message}`);
     } finally {
       this.isSyncing = false;
+      this.dashboard.writeDashboardNote({ isSyncing: false }).catch(() => {
+      });
       if (progressNotice) {
         progressNotice.hide();
         progressNotice = null;
@@ -1496,18 +1557,42 @@ var ManualSyncEngine = class {
         this.statusBar.setStatus("up-to-date");
         return;
       }
+      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
+      for (const [folderPath] of remoteFolders.entries()) {
+        if (this.hasher.isIgnored(folderPath)) continue;
+        const exists = this.app.vault.getAbstractFileByPath(folderPath);
+        if (!exists) {
+          try {
+            await this.app.vault.createFolder(folderPath);
+          } catch (e) {
+          }
+        }
+      }
       let downloadedCount2 = 0;
       let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
       const queue = [...toDownload];
       const WORKER_COUNT = import_obsidian5.Platform.isMobile ? 3 : 6;
       pullNotice = new import_obsidian5.Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
+      let lastDashboardUpdateMs = 0;
+      const maybeUpdateDashboard = async (progressText) => {
+        const now = Date.now();
+        if (now - lastDashboardUpdateMs > 1200 || downloadedCount2 === total) {
+          lastDashboardUpdateMs = now;
+          await this.dashboard.writeDashboardNote({
+            isSyncing: true,
+            syncProgress: progressText
+          });
+        }
+      };
       const updatePullStatus = (currentFilename) => {
         const pct = Math.round(downloadedCount2 / total * 100);
-        this.statusBar.setStatus("syncing", `Pulling ${downloadedCount2}/${total} (${pct}%)`);
+        const displayName = formatNoticeFilename(currentFilename);
+        this.statusBar.setStatus("syncing", `Pulling [${downloadedCount2}/${total}] ${displayName} (${pct}%)`);
         if (pullNotice) {
-          pullNotice.setMessage(`VaultGlide: [${downloadedCount2}/${total}] ${currentFilename} (${pct}%)`);
+          pullNotice.setMessage(`VaultGlide: [${downloadedCount2}/${total}] ${displayName} (${pct}%)`);
         }
+        maybeUpdateDashboard(`Downloading [${downloadedCount2}/${total}] ${displayName} (${pct}%)`);
       };
       const workers = Array(Math.min(WORKER_COUNT, queue.length)).fill(0).map(async () => {
         while (queue.length > 0) {
@@ -1523,7 +1608,7 @@ var ManualSyncEngine = class {
             if (isPluginOrThemeFile(relPath, configDir)) {
               hasUpdatedPluginsOrThemes = true;
             }
-            const newHash = await this.hasher.computeHash(data);
+            const newHash = await this.hasher.computeHash(data, relPath);
             settings.syncedFileHashes[relPath] = newHash;
             downloadedCount2++;
             updatePullStatus(filename);
@@ -1580,6 +1665,8 @@ var ManualSyncEngine = class {
       new import_obsidian5.Notice(`Google Drive Pull failed: ${err.message}`);
     } finally {
       this.isSyncing = false;
+      this.dashboard.writeDashboardNote({ isSyncing: false }).catch(() => {
+      });
       if (pullNotice) {
         pullNotice.hide();
         pullNotice = null;
@@ -1706,12 +1793,25 @@ var ManualSyncEngine = class {
         } else {
           const remoteSize = remote.size !== void 0 ? parseInt(remote.size, 10) : 0;
           const cachedHash = settings.syncedFileHashes[cleanPath];
-          if (cachedHash && cachedHash === local.hash && remoteSize === local.size) {
+          if (cachedHash && cachedHash === local.hash) {
             continue;
+          }
+          const isSizeExact = remoteSize === local.size;
+          const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
+          const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
+          if (isSizeExact || isSizeClose) {
+            const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
+            const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+            const isLocalUntouched = local.mtime <= remoteTime + 3e3 || lastSyncMs > 0 && local.mtime <= lastSyncMs + 3e3;
+            if (isLocalUntouched) {
+              settings.syncedFileHashes[cleanPath] = local.hash;
+              continue;
+            }
           }
           modifiedFiles.push({ path: cleanPath, size: local.size });
         }
       }
+      await this.saveSettings();
       const deletedFiles = [];
       for (const trackedPath of Object.keys(settings.syncedFileHashes || {})) {
         if (!localPathSet.has(trackedPath)) {

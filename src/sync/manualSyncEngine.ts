@@ -9,6 +9,12 @@ import { GoogleDrivePluginSettings, LocalFileHash, RemoteDriveFile, SyncDiffResu
 import { isConfigDirFile, isPluginOrThemeFile } from './configSyncFilter';
 import { DashboardNoteManager } from '../ui/dashboardNote';
 
+function formatNoticeFilename(filename: string): string {
+  const clean = filename.split('/').pop() || filename;
+  if (clean.length <= 22) return clean;
+  return `${clean.slice(0, 10)}...${clean.slice(-10)}`;
+}
+
 export class ManualSyncEngine {
   private hasher: LocalHasher;
   private folderTree: FolderTreeManager;
@@ -98,15 +104,20 @@ export class ManualSyncEngine {
           const cachedHash = settings.syncedFileHashes[cleanPath];
 
           // Check if file content actually changed
-          if (cachedHash && cachedHash === local.hash && remoteSize === local.size) {
+          if (cachedHash && cachedHash === local.hash) {
             // Unchanged file -> Skip upload
             continue;
           }
 
-          if (remoteSize === local.size && !cachedHash) {
-            // First time check: equal size, record hash and skip unless modified
+          const isSizeExact = remoteSize === local.size;
+          const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
+          const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
+
+          if ((isSizeExact || isSizeClose) && !cachedHash) {
+            // First time check: equal/close size, record hash and skip unless modified
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
-            if (local.mtime <= remoteTime + 1000) {
+            const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+            if (local.mtime <= remoteTime + 3000 || (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000)) {
               settings.syncedFileHashes[cleanPath] = local.hash;
               continue;
             }
@@ -211,20 +222,24 @@ export class ManualSyncEngine {
         }
       }
 
-      // 6. Pre-pass: Warm up all unique folder IDs in parallel
-      const uniqueFolders = Array.from(
-        new Set(
-          toUpload.map((item) => {
-            const parts = item.local.relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
-            parts.pop();
-            return parts.join('/');
-          })
-        )
-      ).filter(Boolean);
+      // 6. Pre-pass: Warm up all unique folder IDs in parallel (including empty folders)
+      const uniqueFoldersFromUpload = toUpload.map((item) => {
+        const parts = item.local.relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+        parts.pop();
+        return parts.join('/');
+      }).filter(Boolean);
 
-      if (uniqueFolders.length > 0) {
+      const allLocalFolders = this.app.vault.getAllLoadedFiles()
+        .filter((f): f is TFolder => f instanceof TFolder && f.path !== '/' && f.path !== '');
+      const localFolderPaths = allLocalFolders
+        .map((f) => f.path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+        .filter((p) => p.length > 0 && !this.hasher.isIgnored(p));
+
+      const allFolderPathsToEnsure = Array.from(new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
+
+      if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus('syncing', 'Preparing folders...');
-        await Promise.all(uniqueFolders.map((p) => this.folderTree.ensureFolderPath(`${p}/placeholder.md`)));
+        await Promise.all(allFolderPathsToEnsure.map((p) => this.folderTree.ensureDirectoryPath(p)));
       }
 
       // 7. High-Speed Upload via Continuous Stream & Live Screen Notice
@@ -235,12 +250,26 @@ export class ManualSyncEngine {
 
       progressNotice = new Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
 
+      let lastDashboardUpdateMs = 0;
+      const maybeUpdateDashboard = async (progressText: string) => {
+        const now = Date.now();
+        if (now - lastDashboardUpdateMs > 1200 || uploadedCount === total) {
+          lastDashboardUpdateMs = now;
+          await this.dashboard.writeDashboardNote({
+            isSyncing: true,
+            syncProgress: progressText,
+          });
+        }
+      };
+
       const updatePushStatus = (currentFilename: string) => {
         const pct = Math.round((uploadedCount / total) * 100);
+        const displayName = formatNoticeFilename(currentFilename);
         this.statusBar.setStatus('syncing', `${uploadedCount}/${total} (${pct}%)`);
         if (progressNotice) {
-          progressNotice.setMessage(`VaultGlide: [${uploadedCount}/${total}] ${currentFilename} (${pct}%)`);
+          progressNotice.setMessage(`VaultGlide: [${uploadedCount}/${total}] ${displayName} (${pct}%)`);
         }
+        maybeUpdateDashboard(`Uploading [${uploadedCount}/${total}] ${displayName} (${pct}%)`);
       };
 
       const workers = Array(Math.min(WORKER_COUNT, queue.length))
@@ -337,6 +366,7 @@ export class ManualSyncEngine {
       new Notice(`Google Drive Push failed: ${err.message}`);
     } finally {
       this.isSyncing = false;
+      this.dashboard.writeDashboardNote({ isSyncing: false }).catch(() => {});
       if (progressNotice) {
         progressNotice.hide();
         progressNotice = null;
@@ -466,6 +496,20 @@ export class ManualSyncEngine {
         return;
       }
 
+      // Ensure all remote folders exist locally (including empty folders)
+      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
+      for (const [folderPath] of remoteFolders.entries()) {
+        if (this.hasher.isIgnored(folderPath)) continue;
+        const exists = this.app.vault.getAbstractFileByPath(folderPath);
+        if (!exists) {
+          try {
+            await this.app.vault.createFolder(folderPath);
+          } catch {
+            // Folder may already exist or was created by parent
+          }
+        }
+      }
+
       let downloadedCount = 0;
       let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
@@ -474,12 +518,26 @@ export class ManualSyncEngine {
 
       pullNotice = new Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
 
+      let lastDashboardUpdateMs = 0;
+      const maybeUpdateDashboard = async (progressText: string) => {
+        const now = Date.now();
+        if (now - lastDashboardUpdateMs > 1200 || downloadedCount === total) {
+          lastDashboardUpdateMs = now;
+          await this.dashboard.writeDashboardNote({
+            isSyncing: true,
+            syncProgress: progressText,
+          });
+        }
+      };
+
       const updatePullStatus = (currentFilename: string) => {
         const pct = Math.round((downloadedCount / total) * 100);
-        this.statusBar.setStatus('syncing', `Pulling ${downloadedCount}/${total} (${pct}%)`);
+        const displayName = formatNoticeFilename(currentFilename);
+        this.statusBar.setStatus('syncing', `Pulling [${downloadedCount}/${total}] ${displayName} (${pct}%)`);
         if (pullNotice) {
-          pullNotice.setMessage(`VaultGlide: [${downloadedCount}/${total}] ${currentFilename} (${pct}%)`);
+          pullNotice.setMessage(`VaultGlide: [${downloadedCount}/${total}] ${displayName} (${pct}%)`);
         }
+        maybeUpdateDashboard(`Downloading [${downloadedCount}/${total}] ${displayName} (${pct}%)`);
       };
 
       const workers = Array(Math.min(WORKER_COUNT, queue.length))
@@ -502,7 +560,7 @@ export class ManualSyncEngine {
                 hasUpdatedPluginsOrThemes = true;
               }
 
-              const newHash = await this.hasher.computeHash(data);
+              const newHash = await this.hasher.computeHash(data, relPath);
               settings.syncedFileHashes[relPath] = newHash;
 
               downloadedCount++;
@@ -574,6 +632,7 @@ export class ManualSyncEngine {
       new Notice(`Google Drive Pull failed: ${err.message}`);
     } finally {
       this.isSyncing = false;
+      this.dashboard.writeDashboardNote({ isSyncing: false }).catch(() => {});
       if (pullNotice) {
         pullNotice.hide();
         pullNotice = null;
@@ -724,12 +783,34 @@ export class ManualSyncEngine {
         } else {
           const remoteSize = remote.size !== undefined ? parseInt(remote.size, 10) : 0;
           const cachedHash = settings.syncedFileHashes[cleanPath];
-          if (cachedHash && cachedHash === local.hash && remoteSize === local.size) {
+
+          // 1. Exact cached hash match
+          if (cachedHash && cachedHash === local.hash) {
             continue;
           }
+
+          // 2. Tolerance for first-time scan on mobile / cross-device newline differences
+          const isSizeExact = remoteSize === local.size;
+          const isText = /\.(md|markdown|txt|canvas|json|css|js|ts|html|xml|yaml|yml|csv)$/i.test(cleanPath);
+          const isSizeClose = isText && Math.abs(remoteSize - local.size) < Math.max(50, local.size * 0.15);
+
+          if (isSizeExact || isSizeClose) {
+            const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
+            const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+            const isLocalUntouched = local.mtime <= remoteTime + 3000 || (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000);
+
+            if (isLocalUntouched) {
+              // Auto-seed hash cache so mobile recognizes file as in-sync
+              settings.syncedFileHashes[cleanPath] = local.hash;
+              continue;
+            }
+          }
+
           modifiedFiles.push({ path: cleanPath, size: local.size });
         }
       }
+
+      await this.saveSettings();
 
       const deletedFiles: Array<{ path: string }> = [];
       for (const trackedPath of Object.keys(settings.syncedFileHashes || {})) {
