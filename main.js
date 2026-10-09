@@ -269,33 +269,41 @@ var GDriveClient = class {
    * Prevents duplicate root folders across reconnects.
    */
   async ensureVaultRootFolder(vaultName) {
-    var _a, _b;
+    var _a, _b, _c;
     const sanitizedVaultName = vaultName.trim().replace(/[\/\\:*?"<>|]/g, "_") || "DefaultVault";
     const escapedVaultName = escapeDriveQuery(sanitizedVaultName);
     const rootQuery = await this.request(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        "(name = 'VaultGlide' or name = 'ObsidianSync') and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        "(name = 'VaultGlide' or name = 'vaultglide' or name = 'ObsidianSync') and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
       )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
     );
-    let rootFolderId;
-    if (((_a = rootQuery.json) == null ? void 0 : _a.files) && rootQuery.json.files.length > 0) {
-      const primaryFolder = rootQuery.json.files.find((f) => f.name === "VaultGlide");
-      rootFolderId = (primaryFolder == null ? void 0 : primaryFolder.id) || rootQuery.json.files[0].id;
+    const rootFolders = ((_a = rootQuery.json) == null ? void 0 : _a.files) || [];
+    let defaultRootFolderId;
+    if (rootFolders.length > 0) {
+      const primaryFolder = rootFolders.find((f) => f.name === "VaultGlide");
+      defaultRootFolderId = (primaryFolder == null ? void 0 : primaryFolder.id) || rootFolders[0].id;
     } else {
-      rootFolderId = await this.createFolder("VaultGlide", "root");
+      defaultRootFolderId = await this.createFolder("VaultGlide", "root");
+      rootFolders.push({ id: defaultRootFolderId, name: "VaultGlide" });
     }
-    const vaultQuery = await this.request(
-      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        `name = '${escapedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${rootFolderId}' in parents`
-      )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
-    );
     let vaultFolderId;
-    if (((_b = vaultQuery.json) == null ? void 0 : _b.files) && vaultQuery.json.files.length > 0) {
-      vaultFolderId = vaultQuery.json.files[0].id;
-    } else {
-      vaultFolderId = await this.createFolder(sanitizedVaultName, rootFolderId);
+    let targetRootFolderId = defaultRootFolderId;
+    if (rootFolders.length > 0) {
+      const parentConditions = rootFolders.map((rf) => `'${rf.id}' in parents`).join(" or ");
+      const vaultQuery = await this.request(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
+          `name = '${escapedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and (${parentConditions})`
+        )}&fields=files(id,name,parents,createdTime)&orderBy=createdTime asc`
+      );
+      if (((_b = vaultQuery.json) == null ? void 0 : _b.files) && vaultQuery.json.files.length > 0) {
+        vaultFolderId = vaultQuery.json.files[0].id;
+        targetRootFolderId = ((_c = vaultQuery.json.files[0].parents) == null ? void 0 : _c[0]) || defaultRootFolderId;
+      }
     }
-    return { rootFolderId, vaultFolderId };
+    if (!vaultFolderId) {
+      vaultFolderId = await this.createFolder(sanitizedVaultName, defaultRootFolderId);
+    }
+    return { rootFolderId: targetRootFolderId, vaultFolderId };
   }
   /**
    * Fetches metadata for all non-trashed files and folders inside a given parent folder.

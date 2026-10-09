@@ -100,36 +100,46 @@ export class GDriveClient {
     const sanitizedVaultName = vaultName.trim().replace(/[\/\\:*?"<>|]/g, '_') || 'DefaultVault';
     const escapedVaultName = escapeDriveQuery(sanitizedVaultName);
 
-    // 1. Check or create parent "VaultGlide" (with backwards compatibility for ObsidianSync)
+    // 1. Check or create parent "VaultGlide" (with backwards compatibility for ObsidianSync & vaultglide)
     const rootQuery = await this.request<{ files: RemoteDriveFile[] }>(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        "(name = 'VaultGlide' or name = 'ObsidianSync') and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        "(name = 'VaultGlide' or name = 'vaultglide' or name = 'ObsidianSync') and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
       )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
     );
 
-    let rootFolderId: string;
-    if (rootQuery.json?.files && rootQuery.json.files.length > 0) {
-      const primaryFolder = rootQuery.json.files.find((f) => f.name === 'VaultGlide');
-      rootFolderId = primaryFolder?.id || rootQuery.json.files[0].id;
+    const rootFolders = rootQuery.json?.files || [];
+    let defaultRootFolderId: string;
+    if (rootFolders.length > 0) {
+      const primaryFolder = rootFolders.find((f) => f.name === 'VaultGlide');
+      defaultRootFolderId = primaryFolder?.id || rootFolders[0].id;
     } else {
-      rootFolderId = await this.createFolder('VaultGlide', 'root');
+      defaultRootFolderId = await this.createFolder('VaultGlide', 'root');
+      rootFolders.push({ id: defaultRootFolderId, name: 'VaultGlide' });
     }
 
-    // 2. Check or create vault subfolder
-    const vaultQuery = await this.request<{ files: RemoteDriveFile[] }>(
-      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
-        `name = '${escapedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${rootFolderId}' in parents`
-      )}&fields=files(id,name,createdTime)&orderBy=createdTime asc`
-    );
+    // 2. Check if vault subfolder already exists in ANY of the root folders
+    let vaultFolderId: string | undefined;
+    let targetRootFolderId: string = defaultRootFolderId;
 
-    let vaultFolderId: string;
-    if (vaultQuery.json?.files && vaultQuery.json.files.length > 0) {
-      vaultFolderId = vaultQuery.json.files[0].id;
-    } else {
-      vaultFolderId = await this.createFolder(sanitizedVaultName, rootFolderId);
+    if (rootFolders.length > 0) {
+      const parentConditions = rootFolders.map((rf) => `'${rf.id}' in parents`).join(' or ');
+      const vaultQuery = await this.request<{ files: RemoteDriveFile[] }>(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
+          `name = '${escapedVaultName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and (${parentConditions})`
+        )}&fields=files(id,name,parents,createdTime)&orderBy=createdTime asc`
+      );
+
+      if (vaultQuery.json?.files && vaultQuery.json.files.length > 0) {
+        vaultFolderId = vaultQuery.json.files[0].id;
+        targetRootFolderId = vaultQuery.json.files[0].parents?.[0] || defaultRootFolderId;
+      }
     }
 
-    return { rootFolderId, vaultFolderId };
+    if (!vaultFolderId) {
+      vaultFolderId = await this.createFolder(sanitizedVaultName, defaultRootFolderId);
+    }
+
+    return { rootFolderId: targetRootFolderId, vaultFolderId };
   }
 
   /**
