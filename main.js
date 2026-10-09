@@ -31,7 +31,7 @@ var import_obsidian6 = require("obsidian");
 
 // src/types.ts
 var DEFAULT_SETTINGS = {
-  serverRelayUrl: "http://localhost:5050",
+  serverRelayUrl: "https://obsidian-gdrive-backend.onrender.com",
   accessToken: "",
   refreshToken: "",
   tokenExpiry: 0,
@@ -79,30 +79,46 @@ var GDriveAuth = class {
    * Refreshes the Google OAuth access token using the stored refresh_token.
    */
   async refreshAccessToken() {
+    var _a, _b, _c, _d;
     const settings = this.getSettings();
     if (!settings.refreshToken) return false;
-    try {
-      const relayUrl = settings.serverRelayUrl.replace(/\/+$/, "");
-      const response = await (0, import_obsidian.requestUrl)({
-        url: `${relayUrl}/api/auth/google/refresh`,
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken: settings.refreshToken }),
-        throw: false
-      });
-      if (response.status === 200) {
-        const data = response.json;
-        settings.accessToken = data.accessToken;
-        if (data.expiryDate) {
-          settings.tokenExpiry = data.expiryDate;
-        } else {
-          settings.tokenExpiry = Date.now() + 3600 * 1e3;
+    const cloudRelay = "https://obsidian-gdrive-backend.onrender.com";
+    const urlsToTry = [];
+    if (settings.serverRelayUrl) {
+      urlsToTry.push(settings.serverRelayUrl.replace(/\/+$/, ""));
+    }
+    if (!urlsToTry.includes(cloudRelay)) {
+      urlsToTry.push(cloudRelay);
+    }
+    if (((_a = settings.serverRelayUrl) == null ? void 0 : _a.includes("localhost")) || ((_b = settings.serverRelayUrl) == null ? void 0 : _b.includes("127.0.0.1"))) {
+      urlsToTry.sort((a, b) => a === cloudRelay ? -1 : 1);
+    }
+    for (const relayUrl of urlsToTry) {
+      try {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${relayUrl}/api/auth/google/refresh`,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refreshToken: settings.refreshToken }),
+          throw: false
+        });
+        if (response.status === 200 && ((_c = response.json) == null ? void 0 : _c.accessToken)) {
+          const data = response.json;
+          settings.accessToken = data.accessToken;
+          if (data.expiryDate) {
+            settings.tokenExpiry = data.expiryDate;
+          } else {
+            settings.tokenExpiry = Date.now() + 3600 * 1e3;
+          }
+          if (((_d = settings.serverRelayUrl) == null ? void 0 : _d.includes("localhost")) && relayUrl === cloudRelay) {
+            settings.serverRelayUrl = cloudRelay;
+          }
+          await this.saveSettings();
+          return true;
         }
-        await this.saveSettings();
-        return true;
+      } catch (err) {
+        console.warn(`Failed to refresh Google OAuth token via ${relayUrl}:`, err);
       }
-    } catch (err) {
-      console.warn("Failed to refresh Google OAuth token:", err);
     }
     return false;
   }
@@ -110,28 +126,48 @@ var GDriveAuth = class {
    * Redeems a 6-digit pairing code to link this device.
    */
   async redeemPairingCode(code) {
+    var _a, _b, _c, _d;
     const settings = this.getSettings();
-    const relayUrl = settings.serverRelayUrl.replace(/\/+$/, "");
-    const response = await (0, import_obsidian.requestUrl)({
-      url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
-      method: "GET",
-      headers: { "Content-Type": "application/json" },
-      throw: false
-    });
-    if (response.status === 200) {
-      const data = response.json;
-      settings.accessToken = data.accessToken;
-      if (data.refreshToken) settings.refreshToken = data.refreshToken;
-      if (data.expiryDate) settings.tokenExpiry = data.expiryDate;
-      if (data.userEmail) settings.userEmail = data.userEmail;
-      if (data.vaultName) settings.vaultName = data.vaultName;
-      if (data.vaultFolderId) settings.vaultFolderId = data.vaultFolderId;
-      settings.lastSyncStatus = "up-to-date";
-      await this.saveSettings();
-      return true;
+    const cloudRelay = "https://obsidian-gdrive-backend.onrender.com";
+    const urlsToTry = [];
+    if (settings.serverRelayUrl) {
+      urlsToTry.push(settings.serverRelayUrl.replace(/\/+$/, ""));
     }
-    const errorJson = response.json || {};
-    throw new Error(errorJson.error || `Pairing failed (HTTP ${response.status})`);
+    if (!urlsToTry.includes(cloudRelay)) {
+      urlsToTry.push(cloudRelay);
+    }
+    if (((_a = settings.serverRelayUrl) == null ? void 0 : _a.includes("localhost")) || ((_b = settings.serverRelayUrl) == null ? void 0 : _b.includes("127.0.0.1"))) {
+      urlsToTry.sort((a, b) => a === cloudRelay ? -1 : 1);
+    }
+    let lastError = "Pairing failed";
+    for (const relayUrl of urlsToTry) {
+      try {
+        const response = await (0, import_obsidian.requestUrl)({
+          url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+          throw: false
+        });
+        if (response.status === 200 && ((_c = response.json) == null ? void 0 : _c.accessToken)) {
+          const data = response.json;
+          settings.accessToken = data.accessToken;
+          if (data.refreshToken) settings.refreshToken = data.refreshToken;
+          if (data.expiryDate) settings.tokenExpiry = data.expiryDate;
+          if (data.userEmail) settings.userEmail = data.userEmail;
+          if (data.vaultName) settings.vaultName = data.vaultName;
+          if (data.vaultFolderId) settings.vaultFolderId = data.vaultFolderId;
+          settings.serverRelayUrl = relayUrl;
+          settings.lastSyncStatus = "up-to-date";
+          await this.saveSettings();
+          return true;
+        } else if (response.status !== 404) {
+          lastError = ((_d = response.json) == null ? void 0 : _d.error) || `Pairing failed (HTTP ${response.status})`;
+        }
+      } catch (err) {
+        lastError = err.message || "Connection error";
+      }
+    }
+    throw new Error(lastError);
   }
   /**
    * Generates a 6-digit pairing code on this device to share with another device.

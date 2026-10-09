@@ -34,29 +34,49 @@ export class GDriveAuth {
     const settings = this.getSettings();
     if (!settings.refreshToken) return false;
 
-    try {
-      const relayUrl = settings.serverRelayUrl.replace(/\/+$/, '');
-      const response = await requestUrl({
-        url: `${relayUrl}/api/auth/google/refresh`,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refreshToken: settings.refreshToken }),
-        throw: false,
-      });
+    const cloudRelay = 'https://obsidian-gdrive-backend.onrender.com';
+    const urlsToTry: string[] = [];
 
-      if (response.status === 200) {
-        const data = response.json;
-        settings.accessToken = data.accessToken;
-        if (data.expiryDate) {
-          settings.tokenExpiry = data.expiryDate;
-        } else {
-          settings.tokenExpiry = Date.now() + 3600 * 1000; // 1 hour default
+    // If current setting is configured, try it first unless it's localhost on a non-desktop device
+    if (settings.serverRelayUrl) {
+      urlsToTry.push(settings.serverRelayUrl.replace(/\/+$/, ''));
+    }
+    if (!urlsToTry.includes(cloudRelay)) {
+      urlsToTry.push(cloudRelay);
+    }
+    // If user's relay is localhost/127.0.0.1, prioritize cloudRelay first
+    if (settings.serverRelayUrl?.includes('localhost') || settings.serverRelayUrl?.includes('127.0.0.1')) {
+      urlsToTry.sort((a, b) => (a === cloudRelay ? -1 : 1));
+    }
+
+    for (const relayUrl of urlsToTry) {
+      try {
+        const response = await requestUrl({
+          url: `${relayUrl}/api/auth/google/refresh`,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: settings.refreshToken }),
+          throw: false,
+        });
+
+        if (response.status === 200 && response.json?.accessToken) {
+          const data = response.json;
+          settings.accessToken = data.accessToken;
+          if (data.expiryDate) {
+            settings.tokenExpiry = data.expiryDate;
+          } else {
+            settings.tokenExpiry = Date.now() + 3600 * 1000; // 1 hour default
+          }
+          // If the working URL was the cloud relay, upgrade the setting
+          if (settings.serverRelayUrl?.includes('localhost') && relayUrl === cloudRelay) {
+            settings.serverRelayUrl = cloudRelay;
+          }
+          await this.saveSettings();
+          return true;
         }
-        await this.saveSettings();
-        return true;
+      } catch (err) {
+        console.warn(`Failed to refresh Google OAuth token via ${relayUrl}:`, err);
       }
-    } catch (err) {
-      console.warn('Failed to refresh Google OAuth token:', err);
     }
     return false;
   }
@@ -66,31 +86,49 @@ export class GDriveAuth {
    */
   public async redeemPairingCode(code: string): Promise<boolean> {
     const settings = this.getSettings();
-    const relayUrl = settings.serverRelayUrl.replace(/\/+$/, '');
+    const cloudRelay = 'https://obsidian-gdrive-backend.onrender.com';
+    const urlsToTry: string[] = [];
 
-    const response = await requestUrl({
-      url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      throw: false,
-    });
-
-    if (response.status === 200) {
-      const data = response.json;
-      settings.accessToken = data.accessToken;
-      if (data.refreshToken) settings.refreshToken = data.refreshToken;
-      if (data.expiryDate) settings.tokenExpiry = data.expiryDate;
-      if (data.userEmail) settings.userEmail = data.userEmail;
-      if (data.vaultName) settings.vaultName = data.vaultName;
-      if (data.vaultFolderId) settings.vaultFolderId = data.vaultFolderId;
-
-      settings.lastSyncStatus = 'up-to-date';
-      await this.saveSettings();
-      return true;
+    if (settings.serverRelayUrl) {
+      urlsToTry.push(settings.serverRelayUrl.replace(/\/+$/, ''));
+    }
+    if (!urlsToTry.includes(cloudRelay)) {
+      urlsToTry.push(cloudRelay);
+    }
+    if (settings.serverRelayUrl?.includes('localhost') || settings.serverRelayUrl?.includes('127.0.0.1')) {
+      urlsToTry.sort((a, b) => (a === cloudRelay ? -1 : 1));
     }
 
-    const errorJson = response.json || {};
-    throw new Error(errorJson.error || `Pairing failed (HTTP ${response.status})`);
+    let lastError = 'Pairing failed';
+    for (const relayUrl of urlsToTry) {
+      try {
+        const response = await requestUrl({
+          url: `${relayUrl}/api/pair/${encodeURIComponent(code.trim())}`,
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          throw: false,
+        });
+
+        if (response.status === 200 && response.json?.accessToken) {
+          const data = response.json;
+          settings.accessToken = data.accessToken;
+          if (data.refreshToken) settings.refreshToken = data.refreshToken;
+          if (data.expiryDate) settings.tokenExpiry = data.expiryDate;
+          if (data.userEmail) settings.userEmail = data.userEmail;
+          if (data.vaultName) settings.vaultName = data.vaultName;
+          if (data.vaultFolderId) settings.vaultFolderId = data.vaultFolderId;
+          settings.serverRelayUrl = relayUrl;
+          settings.lastSyncStatus = 'up-to-date';
+          await this.saveSettings();
+          return true;
+        } else if (response.status !== 404) {
+          lastError = response.json?.error || `Pairing failed (HTTP ${response.status})`;
+        }
+      } catch (err: any) {
+        lastError = err.message || 'Connection error';
+      }
+    }
+    throw new Error(lastError);
   }
 
   /**

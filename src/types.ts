@@ -22,7 +22,7 @@ export interface GoogleDrivePluginSettings {
 }
 
 export const DEFAULT_SETTINGS: GoogleDrivePluginSettings = {
-  serverRelayUrl: 'http://localhost:5050',
+  serverRelayUrl: 'https://obsidian-gdrive-backend.onrender.com',
   accessToken: '',
   refreshToken: '',
   tokenExpiry: 0,
