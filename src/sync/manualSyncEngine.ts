@@ -181,7 +181,13 @@ export class ManualSyncEngine {
             // First time check: equal/close size, record hash and skip unless modified
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
-            if (local.mtime <= remoteTime + 3000 || (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000)) {
+            const isLocalUntouched =
+              Platform.isMobile ||
+              !settings.lastSyncTime ||
+              local.mtime <= remoteTime + 3000 ||
+              (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000);
+
+            if (isLocalUntouched) {
               settings.syncedFileHashes[cleanPath] = local.hash;
               continue;
             }
@@ -305,17 +311,17 @@ export class ManualSyncEngine {
       }).filter(Boolean);
 
       const allFolderPathsToEnsure = Array.from(new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
+      // Sort by depth so parent folders are guaranteed to exist before child folders
+      allFolderPathsToEnsure.sort((a, b) => a.split('/').length - b.split('/').length);
 
       let createdFoldersCount = 0;
       if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus('syncing', 'Preparing folders...');
-        await Promise.all(
-          allFolderPathsToEnsure.map(async (p) => {
-            const isNew = !this.folderTree.getCachedFolderId(p);
-            await this.folderTree.ensureDirectoryPath(p);
-            if (isNew) createdFoldersCount++;
-          })
-        );
+        for (const p of allFolderPathsToEnsure) {
+          const isNew = !this.folderTree.getCachedFolderId(p);
+          await this.folderTree.ensureDirectoryPath(p);
+          if (isNew) createdFoldersCount++;
+        }
       }
 
       // 7. High-Speed Upload via Continuous Stream & Live Screen Notice
@@ -491,6 +497,7 @@ export class ManualSyncEngine {
         this.hasher.scanVault(),
         this.folderTree.scanRemoteVaultTree(rootFolderId),
       ]);
+      const cloudManifest = await this.fetchCloudManifest(remoteMap);
 
       const localMap = new Map<string, LocalFileHash>();
       for (const lf of localFiles) {
@@ -540,6 +547,7 @@ export class ManualSyncEngine {
         const local = localMap.get(remotePath);
         const remoteSize = remoteFile.size !== undefined ? parseInt(remoteFile.size, 10) : 0;
         const cachedHash = settings.syncedFileHashes[remotePath];
+        const cloudHash = cloudManifest ? cloudManifest[remotePath] : undefined;
 
         if (!local) {
           // Do not resurrect if deliberately deleted locally prior to push
@@ -552,41 +560,56 @@ export class ManualSyncEngine {
           }
           toDownload.push({ path: remotePath, file: remoteFile });
         } else {
+          // Hash match with local cache OR cloud manifest -> identical, no download needed
+          if ((cachedHash && cachedHash === local.hash) || (cloudHash && cloudHash === local.hash)) {
+            settings.syncedFileHashes[remotePath] = local.hash;
+            continue;
+          }
+
           const isSizeDifferent = remoteSize !== local.size;
           const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
           const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
           // Remote is newer if modifiedTime is after local file or after lastSyncTime
           const isRemoteNewer = remoteTime > local.mtime + 1000 || (lastSyncMs > 0 && remoteTime > lastSyncMs + 1000);
-          const isMissingCachedHash = !cachedHash;
+          const isMissingCachedHash = !cachedHash && !Platform.isMobile && settings.lastSyncTime !== null;
 
-          // Download if size changed, remote is newer, or hash was never cached
+          // Download if size changed, remote is newer, or hash was never cached on existing vault
           if (isSizeDifferent || isRemoteNewer || isMissingCachedHash) {
             toDownload.push({ path: remotePath, file: remoteFile });
+          } else {
+            // Equal size on mobile/first-time sync -> seed hash
+            settings.syncedFileHashes[remotePath] = local.hash;
           }
         }
       }
 
-      if (toDownload.length === 0 && localTrashedCount === 0) {
+      // 3. Ensure all remote folders exist locally (including empty folders) BEFORE checking early return
+      let createdLocalFoldersCount = 0;
+      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
+      const sortedRemoteFolderPaths = Array.from(remoteFolders.keys()).sort(
+        (a, b) => a.split('/').length - b.split('/').length
+      );
+
+      for (const folderPath of sortedRemoteFolderPaths) {
+        if (this.hasher.isIgnored(folderPath)) continue;
+        const exists = this.app.vault.getAbstractFileByPath(folderPath);
+        if (!exists) {
+          try {
+            await this.app.vault.createFolder(folderPath);
+            createdLocalFoldersCount++;
+          } catch {
+            // Folder may already exist or was created by parent
+          }
+        }
+      }
+
+      if (toDownload.length === 0 && localTrashedCount === 0 && createdLocalFoldersCount === 0) {
         new Notice('Google Drive Sync: Your vault is already up to date with Google Drive.');
         settings.lastSyncTime = new Date().toISOString();
         settings.lastSyncStatus = 'up-to-date';
         await this.saveSettings();
         this.statusBar.setStatus('up-to-date');
         return;
-      }
-
-      // Ensure all remote folders exist locally (including empty folders)
-      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
-      for (const [folderPath] of remoteFolders.entries()) {
-        if (this.hasher.isIgnored(folderPath)) continue;
-        const exists = this.app.vault.getAbstractFileByPath(folderPath);
-        if (!exists) {
-          try {
-            await this.app.vault.createFolder(folderPath);
-          } catch {
-            // Folder may already exist or was created by parent
-          }
-        }
       }
 
       let downloadedCount = 0;
@@ -882,7 +905,11 @@ export class ManualSyncEngine {
           if ((isSizeExact || isSizeClose) && !cachedHash && !cloudHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
-            const isLocalUntouched = local.mtime <= remoteTime + 3000 || (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000);
+            const isLocalUntouched =
+              Platform.isMobile ||
+              !settings.lastSyncTime ||
+              local.mtime <= remoteTime + 3000 ||
+              (lastSyncMs > 0 && local.mtime <= lastSyncMs + 3000);
 
             if (isLocalUntouched) {
               // Auto-seed hash cache so mobile recognizes file as in-sync

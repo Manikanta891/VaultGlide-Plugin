@@ -1335,7 +1335,8 @@ var ManualSyncEngine = class {
           if ((isSizeExact || isSizeClose) && !cachedHash && !cloudHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs2 = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
-            if (local.mtime <= remoteTime + 3e3 || lastSyncMs2 > 0 && local.mtime <= lastSyncMs2 + 3e3) {
+            const isLocalUntouched = import_obsidian5.Platform.isMobile || !settings.lastSyncTime || local.mtime <= remoteTime + 3e3 || lastSyncMs2 > 0 && local.mtime <= lastSyncMs2 + 3e3;
+            if (isLocalUntouched) {
               settings.syncedFileHashes[cleanPath] = local.hash;
               continue;
             }
@@ -1421,16 +1422,15 @@ var ManualSyncEngine = class {
         return parts.join("/");
       }).filter(Boolean);
       const allFolderPathsToEnsure = Array.from(/* @__PURE__ */ new Set([...uniqueFoldersFromUpload, ...localFolderPaths]));
+      allFolderPathsToEnsure.sort((a, b) => a.split("/").length - b.split("/").length);
       let createdFoldersCount = 0;
       if (allFolderPathsToEnsure.length > 0) {
         this.statusBar.setStatus("syncing", "Preparing folders...");
-        await Promise.all(
-          allFolderPathsToEnsure.map(async (p) => {
-            const isNew = !this.folderTree.getCachedFolderId(p);
-            await this.folderTree.ensureDirectoryPath(p);
-            if (isNew) createdFoldersCount++;
-          })
-        );
+        for (const p of allFolderPathsToEnsure) {
+          const isNew = !this.folderTree.getCachedFolderId(p);
+          await this.folderTree.ensureDirectoryPath(p);
+          if (isNew) createdFoldersCount++;
+        }
       }
       let uploadedCount2 = 0;
       const total = toUpload.length;
@@ -1575,6 +1575,7 @@ var ManualSyncEngine = class {
         this.hasher.scanVault(),
         this.folderTree.scanRemoteVaultTree(rootFolderId)
       ]);
+      const cloudManifest = await this.fetchCloudManifest(remoteMap);
       const localMap = /* @__PURE__ */ new Map();
       for (const lf of localFiles) {
         localMap.set(lf.relativePath.replace(/\\/g, "/").replace(/^\/+/, ""), lf);
@@ -1614,6 +1615,7 @@ var ManualSyncEngine = class {
         const local = localMap.get(remotePath);
         const remoteSize = remoteFile.size !== void 0 ? parseInt(remoteFile.size, 10) : 0;
         const cachedHash = settings.syncedFileHashes[remotePath];
+        const cloudHash = cloudManifest ? cloudManifest[remotePath] : void 0;
         if (!local) {
           const isPendingDeleted = settings.pendingDeletedPaths && settings.pendingDeletedPaths.some((p) => remotePath === p || remotePath.startsWith(p.endsWith("/") ? p : `${p}/`));
           if (isPendingDeleted) {
@@ -1621,34 +1623,45 @@ var ManualSyncEngine = class {
           }
           toDownload.push({ path: remotePath, file: remoteFile });
         } else {
+          if (cachedHash && cachedHash === local.hash || cloudHash && cloudHash === local.hash) {
+            settings.syncedFileHashes[remotePath] = local.hash;
+            continue;
+          }
           const isSizeDifferent = remoteSize !== local.size;
           const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
           const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
           const isRemoteNewer = remoteTime > local.mtime + 1e3 || lastSyncMs > 0 && remoteTime > lastSyncMs + 1e3;
-          const isMissingCachedHash = !cachedHash;
+          const isMissingCachedHash = !cachedHash && !import_obsidian5.Platform.isMobile && settings.lastSyncTime !== null;
           if (isSizeDifferent || isRemoteNewer || isMissingCachedHash) {
             toDownload.push({ path: remotePath, file: remoteFile });
+          } else {
+            settings.syncedFileHashes[remotePath] = local.hash;
           }
         }
       }
-      if (toDownload.length === 0 && localTrashedCount === 0) {
+      let createdLocalFoldersCount = 0;
+      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
+      const sortedRemoteFolderPaths = Array.from(remoteFolders.keys()).sort(
+        (a, b) => a.split("/").length - b.split("/").length
+      );
+      for (const folderPath of sortedRemoteFolderPaths) {
+        if (this.hasher.isIgnored(folderPath)) continue;
+        const exists = this.app.vault.getAbstractFileByPath(folderPath);
+        if (!exists) {
+          try {
+            await this.app.vault.createFolder(folderPath);
+            createdLocalFoldersCount++;
+          } catch (e) {
+          }
+        }
+      }
+      if (toDownload.length === 0 && localTrashedCount === 0 && createdLocalFoldersCount === 0) {
         new import_obsidian5.Notice("Google Drive Sync: Your vault is already up to date with Google Drive.");
         settings.lastSyncTime = (/* @__PURE__ */ new Date()).toISOString();
         settings.lastSyncStatus = "up-to-date";
         await this.saveSettings();
         this.statusBar.setStatus("up-to-date");
         return;
-      }
-      const remoteFolders = this.folderTree.getAllDiscoveredRemoteFolders();
-      for (const [folderPath] of remoteFolders.entries()) {
-        if (this.hasher.isIgnored(folderPath)) continue;
-        const exists = this.app.vault.getAbstractFileByPath(folderPath);
-        if (!exists) {
-          try {
-            await this.app.vault.createFolder(folderPath);
-          } catch (e) {
-          }
-        }
       }
       let downloadedCount2 = 0;
       let hasUpdatedPluginsOrThemes = false;
@@ -1890,7 +1903,7 @@ var ManualSyncEngine = class {
           if ((isSizeExact || isSizeClose) && !cachedHash && !cloudHash) {
             const remoteTime = remote.modifiedTime ? new Date(remote.modifiedTime).getTime() : 0;
             const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
-            const isLocalUntouched = local.mtime <= remoteTime + 3e3 || lastSyncMs > 0 && local.mtime <= lastSyncMs + 3e3;
+            const isLocalUntouched = import_obsidian5.Platform.isMobile || !settings.lastSyncTime || local.mtime <= remoteTime + 3e3 || lastSyncMs > 0 && local.mtime <= lastSyncMs + 3e3;
             if (isLocalUntouched) {
               settings.syncedFileHashes[cleanPath] = local.hash;
               continue;
