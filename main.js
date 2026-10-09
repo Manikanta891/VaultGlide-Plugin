@@ -1154,6 +1154,7 @@ var ManualSyncEngine = class {
     this.client = client;
     this.offlineTracker = offlineTracker;
     this.statusBar = statusBar;
+    this.isSyncing = false;
     this.hasher = new LocalHasher(app.vault, () => this.getSettings());
     this.dashboard = new DashboardNoteManager(app, getSettings, saveSettings);
     this.folderTree = new FolderTreeManager(
@@ -1173,17 +1174,25 @@ var ManualSyncEngine = class {
    */
   async push() {
     var _a, _b, _c, _d;
+    if (this.isSyncing) {
+      new import_obsidian5.Notice("VaultGlide: Sync operation is already running. Please wait.");
+      return;
+    }
+    this.isSyncing = true;
+    let progressNotice = null;
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
     if (!settings.accessToken) {
       new import_obsidian5.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
       this.statusBar.setStatus("unauthenticated");
+      this.isSyncing = false;
       return;
     }
     if (!navigator.onLine) {
       new import_obsidian5.Notice("Google Drive Sync: You are offline. Changes remain saved locally.");
       this.statusBar.setStatus("offline", `${settings.pendingOfflineChanges.length} pending`);
+      this.isSyncing = false;
       return;
     }
     this.statusBar.setStatus("syncing", "Scanning...");
@@ -1301,8 +1310,8 @@ var ManualSyncEngine = class {
       let uploadedCount2 = 0;
       const total = toUpload.length;
       const queue = [...toUpload];
-      const WORKER_COUNT = 6;
-      let progressNotice = new import_obsidian5.Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
+      const WORKER_COUNT = import_obsidian5.Platform.isMobile ? 3 : 6;
+      progressNotice = new import_obsidian5.Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
       const updatePushStatus = (currentFilename) => {
         const pct = Math.round(uploadedCount2 / total * 100);
         this.statusBar.setStatus("syncing", `${uploadedCount2}/${total} (${pct}%)`);
@@ -1381,6 +1390,12 @@ var ManualSyncEngine = class {
         error: err.message
       });
       new import_obsidian5.Notice(`Google Drive Push failed: ${err.message}`);
+    } finally {
+      this.isSyncing = false;
+      if (progressNotice) {
+        progressNotice.hide();
+        progressNotice = null;
+      }
     }
   }
   /**
@@ -1388,17 +1403,25 @@ var ManualSyncEngine = class {
    */
   async pull() {
     var _a, _b, _c, _d;
+    if (this.isSyncing) {
+      new import_obsidian5.Notice("VaultGlide: Sync operation is already running. Please wait.");
+      return;
+    }
+    this.isSyncing = true;
+    let pullNotice = null;
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
     if (!settings.accessToken) {
       new import_obsidian5.Notice("Google Drive Sync: Please log in or pair device in plugin settings.");
       this.statusBar.setStatus("unauthenticated");
+      this.isSyncing = false;
       return;
     }
     if (!navigator.onLine) {
       new import_obsidian5.Notice("Google Drive Sync: You are offline.");
       this.statusBar.setStatus("offline");
+      this.isSyncing = false;
       return;
     }
     this.statusBar.setStatus("syncing", "Scanning cloud...");
@@ -1453,14 +1476,15 @@ var ManualSyncEngine = class {
           if (isPendingDeleted) {
             continue;
           }
-          toDownload.push(remoteFile);
+          toDownload.push({ path: remotePath, file: remoteFile });
         } else {
           const isSizeDifferent = remoteSize !== local.size;
           const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
-          const isRemoteNewer = remoteTime > local.mtime + 2e3;
-          const isContentMismatch = cachedHash ? cachedHash !== local.hash : true;
-          if (isSizeDifferent || isRemoteNewer && isContentMismatch) {
-            toDownload.push(remoteFile);
+          const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+          const isRemoteNewer = remoteTime > local.mtime + 1e3 || lastSyncMs > 0 && remoteTime > lastSyncMs + 1e3;
+          const isMissingCachedHash = !cachedHash;
+          if (isSizeDifferent || isRemoteNewer || isMissingCachedHash) {
+            toDownload.push({ path: remotePath, file: remoteFile });
           }
         }
       }
@@ -1476,8 +1500,8 @@ var ManualSyncEngine = class {
       let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
       const queue = [...toDownload];
-      const WORKER_COUNT = 6;
-      let pullNotice = new import_obsidian5.Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
+      const WORKER_COUNT = import_obsidian5.Platform.isMobile ? 3 : 6;
+      pullNotice = new import_obsidian5.Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
       const updatePullStatus = (currentFilename) => {
         const pct = Math.round(downloadedCount2 / total * 100);
         this.statusBar.setStatus("syncing", `Pulling ${downloadedCount2}/${total} (${pct}%)`);
@@ -1487,9 +1511,10 @@ var ManualSyncEngine = class {
       };
       const workers = Array(Math.min(WORKER_COUNT, queue.length)).fill(0).map(async () => {
         while (queue.length > 0) {
-          const remoteFile = queue.shift();
-          if (!remoteFile) break;
-          const relPath = this.getRelativePathForRemote(remoteFile, remoteMap);
+          const item = queue.shift();
+          if (!item) break;
+          const relPath = item.path;
+          const remoteFile = item.file;
           const filename = relPath.split("/").pop();
           updatePullStatus(filename);
           try {
@@ -1553,6 +1578,12 @@ var ManualSyncEngine = class {
         error: err.message
       });
       new import_obsidian5.Notice(`Google Drive Pull failed: ${err.message}`);
+    } finally {
+      this.isSyncing = false;
+      if (pullNotice) {
+        pullNotice.hide();
+        pullNotice = null;
+      }
     }
   }
   /**
@@ -1926,6 +1957,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        var _a;
+        if ((_a = this.syncEngine) == null ? void 0 : _a.isSyncing) return;
         if (!navigator.onLine) {
           this.offlineTracker.trackFileModification(file.path);
           this.statusBar.setStatus("offline", `${this.settings.pendingOfflineChanges.length} pending`);
@@ -1937,6 +1970,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("create", (file) => {
+        var _a;
+        if ((_a = this.syncEngine) == null ? void 0 : _a.isSyncing) return;
         if (!navigator.onLine) {
           this.offlineTracker.trackFileModification(file.path);
         } else if (this.settings.lastSyncStatus === "up-to-date") {
@@ -1947,6 +1982,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        var _a;
+        if ((_a = this.syncEngine) == null ? void 0 : _a.isSyncing) return;
         const cleanPath = file.path.replace(/\\/g, "/").replace(/^\/+/, "");
         this.offlineTracker.trackFileDeletion(cleanPath);
         if (this.settings.syncedFileHashes) {
@@ -1965,6 +2002,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        var _a;
+        if ((_a = this.syncEngine) == null ? void 0 : _a.isSyncing) return;
         const cleanOld = oldPath.replace(/\\/g, "/").replace(/^\/+/, "");
         const cleanNew = file.path.replace(/\\/g, "/").replace(/^\/+/, "");
         this.offlineTracker.trackFileDeletion(cleanOld);

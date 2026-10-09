@@ -54,9 +54,10 @@ export default class GoogleDriveSyncPlugin extends Plugin {
       this.statusBar
     );
 
-    // 5. Track local file modifications for offline changes queue
+    // 5. Track local file modifications for offline changes queue (ignored during sync)
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
+        if (this.syncEngine?.isSyncing) return;
         if (!navigator.onLine) {
           this.offlineTracker.trackFileModification(file.path);
           this.statusBar.setStatus('offline', `${this.settings.pendingOfflineChanges.length} pending`);
@@ -69,6 +70,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on('create', (file) => {
+        if (this.syncEngine?.isSyncing) return;
         if (!navigator.onLine) {
           this.offlineTracker.trackFileModification(file.path);
         } else if (this.settings.lastSyncStatus === 'up-to-date') {
@@ -80,6 +82,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
+        if (this.syncEngine?.isSyncing) return;
         const cleanPath = file.path.replace(/\\/g, '/').replace(/^\/+/, '');
         this.offlineTracker.trackFileDeletion(cleanPath);
         if (this.settings.syncedFileHashes) {
@@ -99,6 +102,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
+        if (this.syncEngine?.isSyncing) return;
         const cleanOld = oldPath.replace(/\\/g, '/').replace(/^\/+/, '');
         const cleanNew = file.path.replace(/\\/g, '/').replace(/^\/+/, '');
         this.offlineTracker.trackFileDeletion(cleanOld);

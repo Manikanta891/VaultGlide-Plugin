@@ -1,4 +1,4 @@
-import { App, Notice, TFile, TFolder } from 'obsidian';
+import { App, Notice, TFile, TFolder, Platform } from 'obsidian';
 import { GDriveClient } from '../gdrive/gdriveClient';
 import { FolderTreeManager } from '../gdrive/folderTree';
 import { LocalHasher } from './localHasher';
@@ -13,6 +13,7 @@ export class ManualSyncEngine {
   private hasher: LocalHasher;
   private folderTree: FolderTreeManager;
   public dashboard: DashboardNoteManager;
+  public isSyncing: boolean = false;
 
   constructor(
     private app: App,
@@ -42,6 +43,13 @@ export class ManualSyncEngine {
    * Modifies existing files in-place with zero duplicate creations.
    */
   public async push(): Promise<void> {
+    if (this.isSyncing) {
+      new Notice('VaultGlide: Sync operation is already running. Please wait.');
+      return;
+    }
+    this.isSyncing = true;
+    let progressNotice: Notice | null = null;
+
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
@@ -49,12 +57,14 @@ export class ManualSyncEngine {
     if (!settings.accessToken) {
       new Notice('Google Drive Sync: Please log in or pair device in plugin settings.');
       this.statusBar.setStatus('unauthenticated');
+      this.isSyncing = false;
       return;
     }
 
     if (!navigator.onLine) {
       new Notice('Google Drive Sync: You are offline. Changes remain saved locally.');
       this.statusBar.setStatus('offline', `${settings.pendingOfflineChanges.length} pending`);
+      this.isSyncing = false;
       return;
     }
 
@@ -217,13 +227,13 @@ export class ManualSyncEngine {
         await Promise.all(uniqueFolders.map((p) => this.folderTree.ensureFolderPath(`${p}/placeholder.md`)));
       }
 
-      // 7. High-Speed Upload via 6-Worker Continuous Stream & Live Screen Notice
+      // 7. High-Speed Upload via Continuous Stream & Live Screen Notice
       let uploadedCount = 0;
       const total = toUpload.length;
       const queue = [...toUpload];
-      const WORKER_COUNT = 6;
+      const WORKER_COUNT = Platform.isMobile ? 3 : 6;
 
-      let progressNotice: Notice | null = new Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
+      progressNotice = new Notice(`VaultGlide: Uploading 0/${total} notes...`, 0);
 
       const updatePushStatus = (currentFilename: string) => {
         const pct = Math.round((uploadedCount / total) * 100);
@@ -325,6 +335,12 @@ export class ManualSyncEngine {
       });
 
       new Notice(`Google Drive Push failed: ${err.message}`);
+    } finally {
+      this.isSyncing = false;
+      if (progressNotice) {
+        progressNotice.hide();
+        progressNotice = null;
+      }
     }
   }
 
@@ -332,6 +348,13 @@ export class ManualSyncEngine {
    * PULL: Downloads cloud vault changes directly from Google Drive.
    */
   public async pull(): Promise<void> {
+    if (this.isSyncing) {
+      new Notice('VaultGlide: Sync operation is already running. Please wait.');
+      return;
+    }
+    this.isSyncing = true;
+    let pullNotice: Notice | null = null;
+
     await this.loadSettings();
     const settings = this.getSettings();
     settings.syncedFileHashes = settings.syncedFileHashes || {};
@@ -339,12 +362,14 @@ export class ManualSyncEngine {
     if (!settings.accessToken) {
       new Notice('Google Drive Sync: Please log in or pair device in plugin settings.');
       this.statusBar.setStatus('unauthenticated');
+      this.isSyncing = false;
       return;
     }
 
     if (!navigator.onLine) {
       new Notice('Google Drive Sync: You are offline.');
       this.statusBar.setStatus('offline');
+      this.isSyncing = false;
       return;
     }
 
@@ -395,7 +420,7 @@ export class ManualSyncEngine {
       }
 
       // 2. Identify files that need download with accurate diffing
-      const toDownload: RemoteDriveFile[] = [];
+      const toDownload: Array<{ path: string; file: RemoteDriveFile }> = [];
 
       for (const [remotePath, remoteFile] of remoteMap.entries()) {
         // Skip ignored files (e.g. non-synced config files, unselected plugins, blacklisted data.json)
@@ -416,16 +441,18 @@ export class ManualSyncEngine {
           if (isPendingDeleted) {
             continue;
           }
-          toDownload.push(remoteFile);
+          toDownload.push({ path: remotePath, file: remoteFile });
         } else {
           const isSizeDifferent = remoteSize !== local.size;
           const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
-          const isRemoteNewer = remoteTime > local.mtime + 2000;
-          const isContentMismatch = cachedHash ? cachedHash !== local.hash : true;
+          const lastSyncMs = settings.lastSyncTime ? new Date(settings.lastSyncTime).getTime() : 0;
+          // Remote is newer if modifiedTime is after local file or after lastSyncTime
+          const isRemoteNewer = remoteTime > local.mtime + 1000 || (lastSyncMs > 0 && remoteTime > lastSyncMs + 1000);
+          const isMissingCachedHash = !cachedHash;
 
-          // Download if size changed, or if remote is newer and content doesn't match cached sync
-          if (isSizeDifferent || (isRemoteNewer && isContentMismatch)) {
-            toDownload.push(remoteFile);
+          // Download if size changed, remote is newer, or hash was never cached
+          if (isSizeDifferent || isRemoteNewer || isMissingCachedHash) {
+            toDownload.push({ path: remotePath, file: remoteFile });
           }
         }
       }
@@ -443,9 +470,9 @@ export class ManualSyncEngine {
       let hasUpdatedPluginsOrThemes = false;
       const total = toDownload.length;
       const queue = [...toDownload];
-      const WORKER_COUNT = 6;
+      const WORKER_COUNT = Platform.isMobile ? 3 : 6;
 
-      let pullNotice: Notice | null = new Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
+      pullNotice = new Notice(`VaultGlide: Downloading 0/${total} notes...`, 0);
 
       const updatePullStatus = (currentFilename: string) => {
         const pct = Math.round((downloadedCount / total) * 100);
@@ -459,10 +486,11 @@ export class ManualSyncEngine {
         .fill(0)
         .map(async () => {
           while (queue.length > 0) {
-            const remoteFile = queue.shift();
-            if (!remoteFile) break;
+            const item = queue.shift();
+            if (!item) break;
 
-            const relPath = this.getRelativePathForRemote(remoteFile, remoteMap);
+            const relPath = item.path;
+            const remoteFile = item.file;
             const filename = relPath.split('/').pop()!;
             updatePullStatus(filename);
 
@@ -544,6 +572,12 @@ export class ManualSyncEngine {
       });
 
       new Notice(`Google Drive Pull failed: ${err.message}`);
+    } finally {
+      this.isSyncing = false;
+      if (pullNotice) {
+        pullNotice.hide();
+        pullNotice = null;
+      }
     }
   }
 
